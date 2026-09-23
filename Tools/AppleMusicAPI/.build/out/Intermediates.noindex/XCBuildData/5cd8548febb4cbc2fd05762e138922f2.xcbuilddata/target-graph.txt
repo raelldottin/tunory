@@ -1,0 +1,4 @@
+Target dependency graph (2 targets)
+Target 'AllExcludingTests' in project 'Aggregate'
+➜ Explicit dependency on target 'AMHelper-product' in project 'AMHelper'
+Target 'AMHelper-product' in project 'AMHelper' (no dependencies)
