@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# SwiftPM / xcodebuild build output
+Tools/AppleMusicAPI/.build
+Packages/TunoryCore/.build
+
+# Xcode IDE state
+xcuserdata/
+*.xcuserstate
+
+# Signed helper app built from Tools/AppleMusicAPI (SwiftPM package).
+# The committed SwiftPM sources (main.swift, Package.swift) are the source
+# of truth; the signed binary is a regenerable build product.
+Tools/AppleMusicAPI/AMHelper.app
