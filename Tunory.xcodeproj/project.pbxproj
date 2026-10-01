@@ -6,19 +6,21 @@
 	objectVersion = 90;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		A1F8DFB10000000000000003 /* TunoryCore in Frameworks */ = {isa = PBXBuildFile; productRef = A1F8DFB10000000000000002 /* TunoryCore */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* Tunory.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Tunory.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
-/* Begin PBXBuildFile section */
-		5A11B2A2D0B9A9E1000000A1 /* TunoryApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A11B2A2D0B9A9E1000000B1 /* TunoryApp.swift */; };
-		5A11B2A2D0B9A9E1000000A2 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A11B2A2D0B9A9E1000000B2 /* ContentView.swift */; };
-/* End PBXBuildFile section */
+/* Begin XCLocalSwiftPackageReference section */
+		A1F8DFB10000000000000000 /* Packages/TunoryCore */ = {isa = XCLocalSwiftPackageReference; relativePath = Packages/TunoryCore; };
+/* End XCLocalSwiftPackageReference section */
 
-/* Begin PBXSourceFileReference section */
-		5A11B2A2D0B9A9E1000000B1 /* TunoryApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = TunoryApp.swift; path = Tunory/TunoryApp.swift; sourceTree = "<group>"; };
-		5A11B2A2D0B9A9E1000000B2 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ContentView.swift; path = Tunory/ContentView.swift; sourceTree = "<group>"; };
-/* End PBXSourceFileReference section */
+/* Begin XCSwiftPackageProductDependency section */
+		A1F8DFB10000000000000002 /* TunoryCore */ = {isa = XCSwiftPackageProductDependency; productName = TunoryCore; package = A1F8DFB10000000000000000 /* Packages/TunoryCore */; };
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		0FB408C23061EE400032CF83 /* Tunory */ = {
@@ -32,6 +34,7 @@
 		000000000000000130000000 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				A1F8DFB10000000000000003 /* TunoryCore in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -40,7 +43,8 @@
 		000000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
-				0FB408C23061EE400032CF83 /* tunory_xcode */,
+				0FB408C23061EE400032CF83 /* Tunory */,
+				A1F8DFB10000000000000001 /* TunoryCore */,
 				000000000000000000000020 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -66,7 +70,13 @@
 			);
 			buildRules = (
 			);
+			fileSystemSynchronizedGroups = (
+				0FB408C23061EE400032CF83 /* Tunory */,
+			);
 			name = Tunory;
+			packageProductDependencies = (
+				A1F8DFB10000000000000002 /* TunoryCore */,
+			);
 			productName = MyApp;
 			productReference = 000000000000000000000120 /* Tunory.app */;
 			productType = "com.apple.product-type.application";
@@ -95,6 +105,9 @@
 			);
 			mainGroup = 000000000000000000000001;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				A1F8DFB10000000000000000 /* Packages/TunoryCore */,
+			);
 			preferredProjectObjectVersion = 90;
 			productRefGroup = 000000000000000000000020 /* Products */;
 			projectDirPath = "";
@@ -117,8 +130,6 @@
 		000000000000000120000000 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			files = (
-				5A11B2A2D0B9A9E1000000A1 /* TunoryApp.swift in Sources */,
-				5A11B2A2D0B9A9E1000000A2 /* ContentView.swift in Sources */,
 			);
 		};
 /* End PBXSourcesBuildPhase section */
@@ -259,17 +270,17 @@
 		000000000000000111000000 /* Debug configuration for PBXNativeTarget "Tunory" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
 				CODE_SIGN_ENTITLEMENTS = Tunory/Tunory.entitlements;
-				INFOPLIST_KEY_NSAppleMusicUsageDescription = "Tunory uses Apple Music access to add selected songs to your library and create or update playlists.";
+				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = DHJQ7QC53Z;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = Turnory;
+				INFOPLIST_KEY_CFBundleDisplayName = Tunory;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.music";
+				INFOPLIST_KEY_NSAppleMusicUsageDescription = "Tunory uses Apple Music access to add selected songs to your library and create or update playlists.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -283,36 +294,36 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.raelldottin.Tunory;
+				PRODUCT_BUNDLE_IDENTIFIER = com.raelldottin.tunory;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SUPPORTS_MACCATALYST = NO;
-				TARGETED_DEVICE_FAMILY = "1,2,6";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,6";
 			};
 			name = Debug;
 		};
 		000000000000000112000000 /* Release configuration for PBXNativeTarget "Tunory" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
 				CODE_SIGN_ENTITLEMENTS = Tunory/Tunory.entitlements;
-				INFOPLIST_KEY_NSAppleMusicUsageDescription = "Tunory uses Apple Music access to add selected songs to your library and create or update playlists.";
+				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = DHJQ7QC53Z;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = Turnory;
+				INFOPLIST_KEY_CFBundleDisplayName = Tunory;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.music";
+				INFOPLIST_KEY_NSAppleMusicUsageDescription = "Tunory uses Apple Music access to add selected songs to your library and create or update playlists.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -326,19 +337,19 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.raelldottin.Tunory;
+				PRODUCT_BUNDLE_IDENTIFIER = com.raelldottin.tunory;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SUPPORTS_MACCATALYST = NO;
-				TARGETED_DEVICE_FAMILY = "1,2,6";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,6";
 			};
 			name = Release;
 		};
