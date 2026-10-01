@@ -1,4 +1,4 @@
-# turnory
+# tunory
 
 ## Apple Music API prototype
 
