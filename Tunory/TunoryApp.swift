@@ -378,7 +378,8 @@ enum CLI {
             return report.succeeded ? 0 : 3
 
         case "recover":
-            // Phase 6 restart reconciliation: loads a credential-free
+            // Phase 6 restart reconciliation, now sequenced by the
+            // canonical RecoveryFlow (Phase 9): loads a credential-free
             // checkpoint from a previous interrupted `transact`, reads
             // Apple's ACTUAL state by fresh reads only, and either
             //   • resumes by running the SAME canonical §20 transaction
@@ -387,6 +388,8 @@ enum CLI {
             //     honors the checkpoint's proven claims.
             // No write is attempted before the fresh read-back proves the
             // state safe (the runner's own preflight enforces §13/§20).
+            // Output contract is unchanged from Phase 6: same lines, same
+            // order, same exit codes.
             guard args.count == 2 else {
                 fputs("recover <checkpoint.json|->\n", stderr)
                 return 2
@@ -398,32 +401,21 @@ enum CLI {
                 return 2
             }
             guard await ensureAuthorized() else { return 3 }
-            // Rebuild the manifest the checkpoint was captured against, via
-            // the ONE canonical validated path (ManifestParser.build):
-            // identity from the checkpoint's catalog ids (authoritative
-            // §10), nominal display fields. A corrupted checkpoint (empty,
-            // duplicate ids) fails closed here rather than reaching the
-            // engine.
+            // Canonical step 1: rebuild the manifest the checkpoint was
+            // captured against (one validated path; corruption fails
+            // closed here, before any network traffic).
             let manifest: ParsedManifest
             do {
-                manifest = try ManifestParser.build(
-                    lineCount: checkpoint.manifestCatalogIds.count,
-                    catalogIdForLine: { pos in
-                        pos - 1 < checkpoint.manifestCatalogIds.count
-                            ? checkpoint.manifestCatalogIds[pos - 1] : nil
-                    },
-                    nameForLine: { pos in "Recording \(pos)" },
-                    artistForLine: { _ in "Unknown" })
+                manifest = try RecoveryFlow.manifest(for: checkpoint)
             } catch {
                 fputs("error: invalid checkpoint manifest: \(error)\n", stderr)
                 return 2
             }
+            // Canonical step 2: fresh preflight + pure reconciliation.
             let engine = RESTEngine(transport: MusicDataRequestTransport())
-            let preflight = await engine.preflightPlaylist(named: checkpoint.playlistName,
-                                                           manifest: manifest)
-            switch RecoveryPlanner.reconcile(checkpoint: checkpoint,
+            switch await RecoveryFlow.decide(checkpoint: checkpoint,
                                              manifest: manifest,
-                                             preflight: preflight) {
+                                             engine: engine) {
             case .alreadyComplete:
                 printJSON(RecoveryReport(action: "alreadyComplete",
                                          playlistId: checkpoint.playlistId,
@@ -439,13 +431,12 @@ enum CLI {
                                          resumeFromPosition: resumePos,
                                          storedCatalogIds: stored))
                 fflush(stdout)
-                // Resume = the canonical runner over fresh state. It
-                // re-runs every gate and re-derives the plan; the
-                // checkpoint's role ends here (it was the cross-check).
-                let runner = TransactionRunner(engine: RESTEngine(
-                    transport: MusicDataRequestTransport()))
-                let report = await runner.run(manifest: manifest,
-                                              playlistName: checkpoint.playlistName) { outcome in
+                // Canonical step 3: resume = the canonical runner over
+                // fresh state. It re-runs every gate and re-derives the
+                // plan; the checkpoint's role ended here (it was the
+                // cross-check).
+                let report = await RecoveryFlow.resume(
+                    checkpoint: checkpoint, manifest: manifest, engine: engine) { outcome in
                     printJSON(TransactPhaseReport(phase: phaseLabel(outcome.kind),
                                                   detail: outcome.report))
                 }

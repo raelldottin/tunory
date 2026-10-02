@@ -31,6 +31,9 @@ final class TransactionViewModel: ObservableObject {
     /// not as a blanket banner when a position is known).
     @Published private(set) var failureMessage: String?
     @Published private(set) var failurePosition: Int?
+    /// §10 catalog divergence notes from the canonical gate, in manifest
+    /// order (derived, never re-computed here). Empty when nothing diverged.
+    @Published private(set) var divergenceNotes: [EvidencePresentation.CatalogNote] = []
 
     var playlistName: String = ""
     var createIfMissing: Bool = true
@@ -40,7 +43,15 @@ final class TransactionViewModel: ObservableObject {
     /// append outcomes, and the final read-back — position by position).
     @Published private(set) var rows: [TrackResultRow] = []
 
+    /// Phase 9 persistence: where an interrupted execute's checkpoint is
+    /// saved so the GUI recovery card can pick it up (across relaunch too).
+    private let checkpointStore: CheckpointStore
+
     var isRunning: Bool { stage == .running }
+
+    init(checkpointStore: CheckpointStore = CheckpointStore(directory: CheckpointStore.defaultDirectory())) {
+        self.checkpointStore = checkpointStore
+    }
 
     // MARK: - Entry
 
@@ -93,6 +104,7 @@ final class TransactionViewModel: ObservableObject {
         rows = []
         failureMessage = nil
         failurePosition = nil
+        divergenceNotes = []
 
         let engine = RESTEngine(transport: MusicDataRequestTransport())
         let runner = TransactionRunner(engine: engine)
@@ -107,7 +119,42 @@ final class TransactionViewModel: ObservableObject {
         }
         report = outcome
         rows = Self.deriveRows(resolutions: resolutions, report: outcome)
+
+        // §10 divergence notes, derived from the canonical gate evidence —
+        // presentation shows what the gate recorded, never re-computes.
+        if let catalogGate = outcome.phases.first(where: { $0.kind == .catalogGate }),
+           let catalogReport = catalogGate.catalogReport {
+            divergenceNotes = EvidencePresentation.catalogDivergenceNotes(from: catalogReport)
+        }
+
+        // Phase 9 persistence: an interrupted execute saves its credential-
+        // free checkpoint so the GUI recovery card can offer resumption
+        // (across relaunch too). A verified success clears a superseded
+        // slot — same playlist AND same manifest sequence only.
+        if let stopped = outcome.phases.last, stopped.kind == .stopped,
+           stopped.appendOutcomes?.isEmpty == false,
+           let checkpoint = TransactionRunner.checkpoint(
+            forInterruptedExecuteIn: outcome,
+            capturedAtMillisSinceEpoch: Int64(Date().timeIntervalSince1970 * 1000)) {
+            try? checkpointStore.save(checkpoint)
+        } else if outcome.succeeded, let readback = outcome.finalReadback {
+            _ = checkpointStore.clearIfSuperseded(
+                bySuccessWith: Self.playlistId(in: outcome, verification: readback),
+                manifestCatalogIds: manifest.entries.map(\.catalogId))
+        }
         stage = .finished
+    }
+
+    /// The playlist ID the transaction actually wrote to, from canonical
+    /// evidence (preflight identity), or "" when the run stopped before
+    /// discovering one.
+    private static func playlistId(in report: TransactionReport,
+                                   verification: PlaylistVerification) -> String {
+        if let preflight = report.phases.first(where: { $0.kind == .preflight })?.preflight,
+           case .ok(let playlist, _, _) = preflight {
+            return playlist.id
+        }
+        return verification.playlistId
     }
 
     func reset() {
@@ -117,6 +164,7 @@ final class TransactionViewModel: ObservableObject {
         rows = []
         failureMessage = nil
         failurePosition = nil
+        divergenceNotes = []
     }
 
     // MARK: - Derived presentation (pure)

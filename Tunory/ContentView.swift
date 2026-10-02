@@ -16,6 +16,9 @@ final class MusicAuthViewModel: ObservableObject {
 
     @Published private(set) var state: AuthState = .unknown
     @Published private(set) var connectivity: String = "not tested"
+    /// True while the explicit connectivity check is in flight (Phase 9:
+    /// the button must be disabled so a slow request cannot be doubled).
+    @Published private(set) var isTestingConnectivity = false
 
     init() {
         refresh()
@@ -47,6 +50,8 @@ final class MusicAuthViewModel: ObservableObject {
     /// Read-only Apple Music API check: run a minimal catalog search (limit 1).
     /// Never mutates the user's library.
     func runConnectivityCheck() async {
+        isTestingConnectivity = true
+        defer { isTestingConnectivity = false }
         do {
             var request = MusicCatalogSearchRequest(term: "music", types: [Album.self])
             request.limit = 1
@@ -62,6 +67,7 @@ struct ContentView: View {
     @StateObject private var authModel = MusicAuthViewModel()
     @StateObject private var importModel: ImportViewModel
     @StateObject private var transactionModel = TransactionViewModel()
+    @StateObject private var recoveryModel = RecoveryViewModel()
     @State private var selectedTab: Tab = .status
     @State private var playlistName: String = ""
     @State private var createIfMissing: Bool = true
@@ -87,6 +93,7 @@ struct ContentView: View {
     enum Tab: Hashable {
         case status
         case importReview
+        case recovery
     }
 
     var body: some View {
@@ -94,6 +101,7 @@ struct ContentView: View {
             Picker("Screen", selection: $selectedTab) {
                 Text("Status").tag(Tab.status)
                 Text("Import").tag(Tab.importReview)
+                Text("Recovery").tag(Tab.recovery)
             }
             .pickerStyle(.segmented)
             .padding([.horizontal, .top], 16)
@@ -106,11 +114,20 @@ struct ContentView: View {
                 statusBody
             case .importReview:
                 flowBody
+            case .recovery:
+                RecoveryView(model: recoveryModel)
             }
         }
         .frame(minWidth: 560, minHeight: 420)
         .onChange(of: selectedTab) { _, tab in
             if tab == .importReview { authModel.refresh() }
+            if tab == .recovery { recoveryModel.loadPersisted() }
+        }
+        .onAppear {
+            // Phase 9 application-state handling: surface a persisted
+            // interrupted transaction at launch. Read-only — no write, no
+            // network — the user decides explicitly on the Recovery tab.
+            recoveryModel.loadPersisted()
         }
     }
 
@@ -249,6 +266,21 @@ struct ContentView: View {
                 Text("Connectivity: \(authModel.connectivity)")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                Button("Test Connectivity") {
+                    Task { await authModel.runConnectivityCheck() }
+                }
+                .disabled(authModel.isTestingConnectivity)
+            }
+
+            // Recovery state is visible at launch: a persisted interrupted
+            // transaction is surfaced here too, with an explicit jump to
+            // the Recovery tab (no automatic action).
+            if recoveryModel.hasPending {
+                Label("An interrupted import can be resumed or dismissed on the Recovery tab.",
+                      systemImage: "arrow.trianglehead.2.clockwise.rotatepath")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                Button("Open Recovery") { selectedTab = .recovery }
             }
         }
         .padding(32)

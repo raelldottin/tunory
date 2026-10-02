@@ -15,6 +15,9 @@ struct ResultsView: View {
                 if let report = model.report {
                     summary(report)
                 }
+                if !model.divergenceNotes.isEmpty {
+                    divergenceSection
+                }
                 if let message = model.failureMessage {
                     // Manifest-build failures point at the affected line.
                     Label(message, systemImage: "exclamationmark.triangle")
@@ -114,6 +117,45 @@ struct ResultsView: View {
         case .checkpointDiverged(let reason):
             return "The saved progress no longer matches Apple Music (\(reason)). Resolve the playlist manually, then retry."
         }
+    }
+
+    /// §10 divergence section: the catalog gate found recordings whose
+    /// requested names diverge from what the catalog returns at those IDs.
+    /// Identity is the catalog ID (the gate passed); these are review
+    /// notes so the mismatch is never silently accepted. All text comes
+    /// from EvidencePresentation — one wording, one place.
+    private var divergenceSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Some recordings differ from their requested names", systemImage: "exclamationmark.triangle")
+                .font(.headline)
+                .foregroundStyle(.orange)
+            Text("The catalog IDs are exact (that is the identity Tunory writes); the names below are what Apple Music returns at those IDs. Review them before relying on the playlist's names.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            ForEach(model.divergenceNotes, id: \.pos) { note in
+                HStack(alignment: .top, spacing: 8) {
+                    Text("\(note.pos).")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(width: 32, alignment: .trailing)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Asked for: \(note.requestedName)")
+                            .font(.callout)
+                        Text(EvidencePresentation.divergenceText(for: note))
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                        Text("Catalog ID \(note.catalogId)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .padding(12)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private var rows: some View {
