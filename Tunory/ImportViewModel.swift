@@ -38,9 +38,19 @@ final class ImportViewModel: ObservableObject {
     // MARK: - Import entry points
 
     /// Imports a JSON manifest from a file URL (open-panel selected).
+    ///
+    /// The app is sandboxed: a URL handed over by the file importer is only
+    /// readable inside a security-scoped resource session
+    /// (start/stopAccessingSecurityScopedResource). The panel's consent alone
+    /// (the com.apple.macl grant) does not make a bare Data(contentsOf:)
+    /// readable — it fails with NSFileReadNoPermissionError under the sandbox.
+    /// No bookmark is persisted: the file is read exactly once, immediately.
     func importManifest(from url: URL) {
         do {
-            let data = try Data(contentsOf: url)
+            let data: Data
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            data = try Data(contentsOf: url)
             let manifest = try ManifestParser.parse(data: data)
             let lines = manifest.entries.map { entry in
                 ParsedLine(pos: entry.pos, rawTitle: entry.name, kind: .link,

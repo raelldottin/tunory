@@ -45,9 +45,10 @@ struct ImportView: View {
                       onCompletion: { result in
                           switch result {
                           case .success(let url):
-                              // Security-scoped bookmark not required for
-                              // user-selected files in sandbox; access granted
-                              // for the session by the panel itself.
+                              // Sandboxed read: the picked URL is only readable
+                              // inside start/stopAccessingSecurityScopedResource,
+                              // which importManifest(from:) performs around the
+                              // single immediate read.
                               model.importManifest(from: url)
                           case .failure(let error):
                               model.setParseError(error.localizedDescription)
