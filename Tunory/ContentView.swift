@@ -43,20 +43,25 @@ struct ContentView: View {
     }
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            Tab("Status", systemImage: "waveform", value: Destination.status) {
-                NavigationStack { statusBody.navigationTitle("Tunory") }
-            }
-            Tab("Import", systemImage: "square.and.arrow.down", value: Destination.importReview) {
-                NavigationStack { flowBody.navigationTitle(importTitle) }
-            }
-            Tab("Recovery", systemImage: "arrow.clockwise", value: Destination.recovery) {
-                NavigationStack {
-                    RecoveryView(model: recoveryModel,
-                                 canResume: authModel.state == .authorized && !writeActionInFlight && !transactionModel.isRunning && !importModel.isBusy,
-                                 onResume: resumeRecovery,
-                                 onOpenStatus: { selectedTab = .status })
-                        .navigationTitle("Recovery")
+        VStack(spacing: 0) {
+            #if DEBUG
+            validationBanner
+            #endif
+            TabView(selection: $selectedTab) {
+                Tab("Status", systemImage: "waveform", value: Destination.status) {
+                    NavigationStack { statusBody.navigationTitle("Tunory") }
+                }
+                Tab("Import", systemImage: "square.and.arrow.down", value: Destination.importReview) {
+                    NavigationStack { flowBody.navigationTitle(importTitle) }
+                }
+                Tab("Recovery", systemImage: "arrow.clockwise", value: Destination.recovery) {
+                    NavigationStack {
+                        RecoveryView(model: recoveryModel,
+                                     canResume: authModel.state == .authorized && !writeActionInFlight && !transactionModel.isRunning && !importModel.isBusy,
+                                     onResume: resumeRecovery,
+                                     onOpenStatus: { selectedTab = .status })
+                            .navigationTitle("Recovery")
+                    }
                 }
             }
         }
@@ -64,21 +69,6 @@ struct ContentView: View {
         .frame(minWidth: 520, minHeight: 520)
         #endif
         #if DEBUG
-        .safeAreaInset(edge: .top) {
-            if let validationContext {
-                VStack(alignment: .leading, spacing: 4) {
-                    Label("UI validation · sample data", systemImage: "testtube.2")
-                    Text("Sample data · no live Apple Music")
-                    if let error = validationContext.setupError { Text(error).accessibilityIdentifier("validation.setupError") }
-                }
-                .font(.caption).padding(8)
-                .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.regularMaterial)
-                .accessibilityElement(children: .combine)
-                .accessibilityIdentifier("validation.banner")
-            }
-        }
         .preferredColorScheme(validationContext?.colorScheme)
         #endif
         .onChange(of: scenePhase) { _, phase in
@@ -96,6 +86,24 @@ struct ContentView: View {
             recoveryModel.loadPersisted()
         }
     }
+
+    #if DEBUG
+    @ViewBuilder private var validationBanner: some View {
+        if let validationContext {
+            VStack(alignment: .leading, spacing: 4) {
+                Label("UI validation · sample data", systemImage: "testtube.2")
+                Text("Sample data · no live Apple Music")
+                if let error = validationContext.setupError { Text(error).accessibilityIdentifier("validation.setupError") }
+            }
+            .font(.caption).padding(8)
+            .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.regularMaterial)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("validation.banner")
+        }
+    }
+    #endif
 
     private func refreshAuthorization() {
         authModel.refresh()

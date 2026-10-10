@@ -19,12 +19,12 @@ final class UIValidationContext {
         guard let index = args.firstIndex(of: "--ui-validation"), args.indices.contains(index + 1) else { return nil }
         let scenario = args[index + 1]
         guard ["normal", "denied", "restricted", "catalog-failure", "recovery", "corrupt-recovery", "diverged-recovery", "stopped-write", "failed-readback"].contains(scenario) else { return nil }
-        return UIValidationContext(scenario: scenario, darkAppearance: args.contains("--ui-dark"))
+        return UIValidationContext(scenario: scenario, darkAppearance: args.contains("--ui-dark"), lightAppearance: args.contains("--ui-light"))
     }
 
-    init(scenario: String, darkAppearance: Bool = false) {
+    init(scenario: String, darkAppearance: Bool = false, lightAppearance: Bool = false) {
         self.scenario = scenario
-        colorScheme = darkAppearance ? .dark : nil
+        colorScheme = darkAppearance ? .dark : lightAppearance ? .light : nil
         store = CheckpointStore(directory: FileManager.default.temporaryDirectory.appendingPathComponent("tunory-ui-validation-\(UUID().uuidString)", isDirectory: true))
         transport = UIValidationTransport(scenario: scenario)
         do {

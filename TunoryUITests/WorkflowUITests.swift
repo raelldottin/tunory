@@ -4,11 +4,12 @@ import XCTest
 final class WorkflowUITests: XCTestCase {
     override func setUpWithError() throws { continueAfterFailure = false }
 
-    private func launch(_ scenario: String = "normal", largeText: Bool = false, dark: Bool = false) throws -> XCUIApplication {
+    private func launch(_ scenario: String = "normal", largeText: Bool = false, dark: Bool = false, light: Bool = false) throws -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["--ui-validation", scenario]
         if largeText { app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"] }
         if dark { app.launchArguments += ["--ui-dark"] }
+        if light { app.launchArguments += ["--ui-light"] }
         app.launch()
         let banner = app.descendants(matching: .any).matching(identifier: "validation.banner").firstMatch
         guard banner.waitForExistence(timeout: 10) else {
@@ -28,15 +29,37 @@ final class WorkflowUITests: XCTestCase {
 
     private enum ValidationError: Error { case missingBanner, missingControl }
 
+    private func expectConfirmation(_ title: String, in app: XCUIApplication) {
+        #if os(macOS)
+        let dialog = app.sheets["alert"].firstMatch
+        XCTAssertTrue(dialog.waitForExistence(timeout: 5))
+        XCTAssertTrue(dialog.staticTexts.matching(NSPredicate(format: "label == %@ OR value == %@", title, title)).firstMatch.exists)
+        #else
+        XCTAssertTrue(app.sheets[title].waitForExistence(timeout: 5))
+        #endif
+        capture("Native confirmation: \(title)", app: app)
+    }
+
     private func dismissKeyboard(_ app: XCUIApplication) {
         #if os(iOS)
         let done = app.buttons["import.dismissKeyboard"]
-        if done.exists && done.isHittable { done.tap() }
+        XCTAssertTrue(done.waitForExistence(timeout: 5))
+        XCTAssertTrue(done.isHittable)
+        capture("Focused editor with navigation Done", app: app)
+        done.tap()
+        let dismissed = NSPredicate(format: "exists == false")
+        let keyboardGone = XCTNSPredicateExpectation(predicate: dismissed, object: app.keyboards.firstMatch)
+        XCTAssertEqual(XCTWaiter.wait(for: [keyboardGone], timeout: 5), .completed)
+        capture("Keyboard dismissed by navigation Done", app: app)
         #endif
     }
 
     private func cancelConfirmation(_ app: XCUIApplication, button: String) throws {
+        #if os(macOS)
+        let cancel = app.sheets["alert"].buttons[button].firstMatch
+        #else
         let cancel = app.buttons[button].firstMatch
+        #endif
         if cancel.exists && cancel.isHittable {
             interact(cancel)
             return
@@ -61,13 +84,28 @@ final class WorkflowUITests: XCTestCase {
     private func control(_ identifier: String, in app: XCUIApplication) throws -> XCUIElement {
         let element = app.descendants(matching: .any).matching(identifier: identifier).firstMatch
         for _ in 0..<12 {
-            if element.exists && element.isHittable { return element }
+            #if os(iOS)
+            let scroll = app.scrollViews["screen.scroll"]
+            let scrollFrame = scroll.frame
+            let top = max(scrollFrame.minY, app.navigationBars.firstMatch.frame.maxY)
+            let bottom = min(scrollFrame.maxY, app.tabBars.firstMatch.frame.minY)
+            var scrollTowardTop = false
+            #endif
+            if element.exists && element.isHittable {
+                #if os(iOS)
+                let frame = element.frame
+                if frame.minY >= top && frame.maxY <= bottom { return element }
+                if frame.height > bottom - top, frame.midY > top, frame.midY < bottom { return element }
+                scrollTowardTop = frame.height > bottom - top ? frame.midY <= top : frame.minY < top
+                #else
+                return element
+                #endif
+            }
             #if os(macOS)
             app.scrollViews["screen.scroll"].scroll(byDeltaX: 0, deltaY: -350)
             #else
-            let scroll = app.scrollViews["screen.scroll"]
-            let start = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.8))
-            let end = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.25))
+            let start = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: scrollTowardTop ? 0.25 : 0.8))
+            let end = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: scrollTowardTop ? 0.8 : 0.25))
             start.press(forDuration: 0.05, thenDragTo: end)
             #endif
         }
@@ -81,7 +119,11 @@ final class WorkflowUITests: XCTestCase {
     }
 
     private func capture(_ name: String, app: XCUIApplication) {
+        #if os(macOS)
+        let attachment = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
+        #else
         let attachment = XCTAttachment(screenshot: app.screenshot())
+        #endif
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
@@ -108,8 +150,13 @@ final class WorkflowUITests: XCTestCase {
 
     private func confirmImport(_ app: XCUIApplication) throws {
         interact(try control("configure.start", in: app))
-        XCTAssertTrue(app.sheets["Start this Apple Music import?"].waitForExistence(timeout: 5))
-        let confirm = app.buttons.matching(NSPredicate(format: "label == %@ AND identifier != %@", "Start Import", "configure.start"))
+        expectConfirmation("Start this Apple Music import?", in: app)
+        #if os(macOS)
+        let confirmationButtons = app.sheets["alert"].buttons
+        #else
+        let confirmationButtons = app.buttons
+        #endif
+        let confirm = confirmationButtons.matching(NSPredicate(format: "label == %@ AND identifier != %@", "Start Import", "configure.start"))
             .allElementsBoundByIndex.first { $0.isHittable }
         guard let confirm else { XCTFail("Expected native write confirmation."); throw ValidationError.missingControl }
         interact(confirm)
@@ -120,7 +167,7 @@ final class WorkflowUITests: XCTestCase {
         capture("Status and read-only boundaries", app: app)
         try configure(app)
         interact(try control("configure.start", in: app))
-        XCTAssertTrue(app.sheets["Start this Apple Music import?"].waitForExistence(timeout: 5))
+        expectConfirmation("Start this Apple Music import?", in: app)
         capture("Native import confirmation", app: app)
         try cancelConfirmation(app, button: "Cancel")
         XCTAssertTrue(app.textFields["configure.playlistName"].exists)
@@ -183,7 +230,7 @@ final class WorkflowUITests: XCTestCase {
     func testUnreadableCheckpointDismissalRequiresConfirmation() throws {
         let app = try launch("corrupt-recovery")
         interact(try control("recovery.dismiss", in: app))
-        XCTAssertTrue(app.sheets["Dismiss saved import progress?"].waitForExistence(timeout: 5))
+        expectConfirmation("Dismiss saved import progress?", in: app)
         capture("Native checkpoint dismissal confirmation", app: app)
         try cancelConfirmation(app, button: "Keep Saved Progress")
         XCTAssertTrue(app.buttons["recovery.dismiss"].exists)
@@ -220,7 +267,6 @@ final class WorkflowUITests: XCTestCase {
         capture("Restricted access", app: app)
     }
 
-    #if os(iOS)
     func testDarkAppearanceReviewAndRecoveryRemainNavigable() throws {
         let app = try launch(dark: true)
         capture("Dark appearance status", app: app)
@@ -231,6 +277,43 @@ final class WorkflowUITests: XCTestCase {
         capture("Dark appearance recovery", app: recovery)
     }
 
+    func testLightAppearanceReviewAndRecoveryRemainNavigable() throws {
+        let app = try launch(light: true)
+        capture("Light appearance status", app: app)
+        try configure(app)
+        app.terminate()
+        let recovery = try launch("recovery", light: true)
+        XCTAssertTrue(try control("recovery.resume", in: recovery).isHittable)
+        capture("Light appearance recovery", app: recovery)
+    }
+
+    #if os(macOS)
+    func testKeyboardEditingAndEscapeCancelWrites() throws {
+        let app = try launch()
+        interact(try control("status.openImport", in: app))
+        let editor = try control("import.pastedText", in: app)
+        interact(editor)
+        editor.typeText("Wrong title")
+        editor.typeKey("a", modifierFlags: .command)
+        editor.typeText("First Song")
+        XCTAssertEqual((editor.value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), "First Song")
+        capture("Keyboard replacement in labeled song editor", app: app)
+        interact(try control("import.parse", in: app))
+        interact(try control("import.resolve", in: app))
+        interact(try control("import.candidate.1.101", in: app))
+        interact(try control("import.continue", in: app))
+        interact(try control("configure.start", in: app))
+        expectConfirmation("Start this Apple Music import?", in: app)
+        app.typeKey(.escape, modifierFlags: [])
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.sheets["alert"].firstMatch)
+        XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 5), .completed)
+        XCTAssertTrue(app.textFields["configure.playlistName"].exists)
+        XCTAssertFalse(app.buttons["transaction.viewResults"].exists)
+        capture("Escape retained configuration without writes", app: app)
+    }
+    #endif
+
+    #if os(iOS)
     func testAccessibilityTextActuallyEnlargesAndRemainsNavigable() throws {
         let normal = try launch()
         let height = normal.staticTexts["status.authorization"].firstMatch.frame.height

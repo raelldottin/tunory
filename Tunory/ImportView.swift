@@ -94,10 +94,11 @@ struct ImportView: View {
         }
         #if os(iOS)
         .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button("Done") { isEditingInput = false }
-                    .accessibilityIdentifier("import.dismissKeyboard")
+            ToolbarItem(placement: .topBarTrailing) {
+                if isEditingInput {
+                    Button("Done") { isEditingInput = false }
+                        .accessibilityIdentifier("import.dismissKeyboard")
+                }
             }
         }
         #endif
