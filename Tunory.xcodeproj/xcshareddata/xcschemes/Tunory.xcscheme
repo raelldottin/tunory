@@ -29,6 +29,22 @@
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES"
       shouldAutocreateTestPlan = "YES">
+      <Testables>
+         <TestableReference skipped = "NO">
+            <BuildableReference BuildableIdentifier = "primary"
+               BlueprintIdentifier = "C20000000000000000000006"
+               BuildableName = "TunoryUITests.xctest" BlueprintName = "TunoryUITests"
+               ReferencedContainer = "container:Tunory.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference skipped = "NO">
+            <BuildableReference BuildableIdentifier = "primary"
+               BlueprintIdentifier = "B20000000000000000000006"
+               BuildableName = "TunoryTests.xctest" BlueprintName = "TunoryTests"
+               ReferencedContainer = "container:Tunory.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+      </Testables>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"

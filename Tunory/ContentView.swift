@@ -1,301 +1,291 @@
 import SwiftUI
-import MusicKit
-import Combine
 import TunoryCore
 
-@MainActor
-final class MusicAuthViewModel: ObservableObject {
-    enum AuthState: Equatable {
-        case unknown
-        case notDetermined
-        case denied
-        case restricted
-        case authorized
-        case failure(String)
-    }
-
-    @Published private(set) var state: AuthState = .unknown
-    @Published private(set) var connectivity: String = "not tested"
-    /// True while the explicit connectivity check is in flight (Phase 9:
-    /// the button must be disabled so a slow request cannot be doubled).
-    @Published private(set) var isTestingConnectivity = false
-
-    init() {
-        refresh()
-    }
-
-    func refresh() {
-        switch MusicAuthorization.currentStatus {
-        case .authorized:
-            state = .authorized
-        case .denied:
-            state = .denied
-        case .restricted:
-            state = .restricted
-        case .notDetermined:
-            state = .notDetermined
-        @unknown default:
-            state = .failure("unknown authorization status")
-        }
-    }
-
-    func requestAuthorization() async {
-        let status = await MusicAuthorization.request()
-        refresh()
-        if status == .authorized {
-            await runConnectivityCheck()
-        }
-    }
-
-    /// Read-only Apple Music API check: run a minimal catalog search (limit 1).
-    /// Never mutates the user's library.
-    func runConnectivityCheck() async {
-        isTestingConnectivity = true
-        defer { isTestingConnectivity = false }
-        do {
-            var request = MusicCatalogSearchRequest(term: "music", types: [Album.self])
-            request.limit = 1
-            let response = try await request.response()
-            connectivity = "reachable (albums returned: \(response.albums.count))"
-        } catch {
-            connectivity = "unreachable: \(error.localizedDescription)"
-        }
-    }
-}
-
 struct ContentView: View {
-    @StateObject private var authModel = MusicAuthViewModel()
+    @StateObject private var authModel: MusicAuthViewModel
     @StateObject private var importModel: ImportViewModel
-    @StateObject private var transactionModel = TransactionViewModel()
-    @StateObject private var recoveryModel = RecoveryViewModel()
-    @State private var selectedTab: Tab = .status
-    @State private var playlistName: String = ""
-    @State private var createIfMissing: Bool = true
+    @StateObject private var transactionModel: TransactionViewModel
+    @StateObject private var recoveryModel: RecoveryViewModel
+    #if DEBUG
+    private let validationContext: UIValidationContext?
+    #endif
+    @Environment(\.scenePhase) private var scenePhase
+    enum Destination: Hashable { case status, importReview, recovery }
+    enum FlowStep: Hashable { case review, configure, run, results }
+    @State private var selectedTab: Destination = .status
+    @State private var flowStep: FlowStep = .review
+    @State private var playlistName = ""
+    @State private var createIfMissing = true
+    @State private var showWriteConfirmation = false
+    @State private var writeActionInFlight = false
 
     init() {
-        // ImportViewModel needs the auth model; both are MainActor.
+        #if DEBUG
+        let validation = UIValidationContext.fromArguments()
+        self.validationContext = validation
+        if let validation {
+            let auth = validation.makeAuth()
+            _authModel = StateObject(wrappedValue: auth)
+            _importModel = StateObject(wrappedValue: ImportViewModel(authModel: auth, makeEngine: validation.makeResolutionEngine))
+            _transactionModel = StateObject(wrappedValue: TransactionViewModel(checkpointStore: validation.store,
+                authorizationStatus: { validation.authorization }, makeEngine: validation.makeEngine))
+            _recoveryModel = StateObject(wrappedValue: RecoveryViewModel(store: validation.store,
+                authorizationStatus: { validation.authorization }, makeEngine: validation.makeEngine))
+            if validation.opensRecovery { _selectedTab = State(initialValue: .recovery) }
+            return
+        }
+        #endif
         let auth = MusicAuthViewModel()
         _authModel = StateObject(wrappedValue: auth)
         _importModel = StateObject(wrappedValue: ImportViewModel(authModel: auth))
-    }
-
-    /// The GUI flow state machine (Import → Review → Configure → Run →
-    /// Results). Phase 5 keeps first release small and focused on
-    /// importing music; each step exposes exactly one action.
-    private enum FlowStep: Equatable {
-        case review      // recording review (Import & Review screen)
-        case configure   // playlist name + create policy
-        case run         // progress screen
-        case results     // results screen
-    }
-    @State private var flowStep: FlowStep = .review
-
-    enum Tab: Hashable {
-        case status
-        case importReview
-        case recovery
+        _transactionModel = StateObject(wrappedValue: TransactionViewModel())
+        _recoveryModel = StateObject(wrappedValue: RecoveryViewModel())
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            Picker("Screen", selection: $selectedTab) {
-                Text("Status").tag(Tab.status)
-                Text("Import").tag(Tab.importReview)
-                Text("Recovery").tag(Tab.recovery)
+        TabView(selection: $selectedTab) {
+            Tab("Status", systemImage: "waveform", value: Destination.status) {
+                NavigationStack { statusBody.navigationTitle("Tunory") }
             }
-            .pickerStyle(.segmented)
-            .padding([.horizontal, .top], 16)
-
-            Divider()
-                .padding(.top, 8)
-
-            switch selectedTab {
-            case .status:
-                statusBody
-            case .importReview:
-                flowBody
-            case .recovery:
-                RecoveryView(model: recoveryModel)
+            Tab("Import", systemImage: "square.and.arrow.down", value: Destination.importReview) {
+                NavigationStack { flowBody.navigationTitle(importTitle) }
+            }
+            Tab("Recovery", systemImage: "arrow.clockwise", value: Destination.recovery) {
+                NavigationStack {
+                    RecoveryView(model: recoveryModel,
+                                 canResume: authModel.state == .authorized && !writeActionInFlight && !transactionModel.isRunning && !importModel.isBusy,
+                                 onResume: resumeRecovery,
+                                 onOpenStatus: { selectedTab = .status })
+                        .navigationTitle("Recovery")
+                }
             }
         }
-        .frame(minWidth: 560, minHeight: 420)
+        #if os(macOS)
+        .frame(minWidth: 520, minHeight: 520)
+        #endif
+        #if DEBUG
+        .safeAreaInset(edge: .top) {
+            if let validationContext {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("UI validation · sample data", systemImage: "testtube.2")
+                    Text("Sample data · no live Apple Music")
+                    if let error = validationContext.setupError { Text(error).accessibilityIdentifier("validation.setupError") }
+                }
+                .font(.caption).padding(8)
+                .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.regularMaterial)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("validation.banner")
+            }
+        }
+        .preferredColorScheme(validationContext?.colorScheme)
+        #endif
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { refreshAuthorization() }
+        }
         .onChange(of: selectedTab) { _, tab in
-            if tab == .importReview { authModel.refresh() }
-            if tab == .recovery { recoveryModel.loadPersisted() }
+            refreshAuthorization()
+            if tab == .recovery, recoveryModel.stage != .finished { recoveryModel.loadPersisted() }
         }
-        .onAppear {
-            // Phase 9 application-state handling: surface a persisted
-            // interrupted transaction at launch. Read-only — no write, no
-            // network — the user decides explicitly on the Recovery tab.
+        .onChange(of: transactionModel.stage) { _, stage in
+            if stage == .finished { recoveryModel.loadPersisted() }
+        }
+        .task {
+            refreshAuthorization()
             recoveryModel.loadPersisted()
         }
     }
 
-    // MARK: - Import flow
+    private func refreshAuthorization() {
+        authModel.refresh()
+        importModel.refreshAuth()
+    }
 
-    @ViewBuilder
-    private var flowBody: some View {
-        // ImportView models its own idle→parsed→resolving→review phases;
-        // the outer flow advances to configure only when every line is
-        // resolved, and to run/results via explicit single actions.
+    private var importTitle: String {
+        switch flowStep {
+        case .review: return String(localized: "Import and Review")
+        case .configure: return String(localized: "Configure Playlist")
+        case .run: return String(localized: "Import Progress")
+        case .results: return String(localized: "Import Results")
+        }
+    }
+
+    @ViewBuilder private var flowBody: some View {
         switch flowStep {
         case .review:
             ImportView(authModel: authModel, model: importModel,
-                      onAllResolved: { flowStep = .configure })
-        case .configure:
-            configureBody
+                       isWorkflowBusy: writeActionInFlight || transactionModel.isRunning || recoveryModel.isRunning,
+                       onOpenStatus: { selectedTab = .status },
+                       onAllResolved: { flowStep = .configure })
+        case .configure: configureBody
         case .run:
-            TransactionProgressView(model: transactionModel,
-                                    onViewResults: { flowStep = .results })
+            TransactionProgressView(model: transactionModel, onViewResults: { flowStep = .results })
         case .results:
             ResultsView(model: transactionModel) {
+                guard !transactionModel.isRunning, !recoveryModel.isRunning else { return }
                 transactionModel.reset()
                 importModel.reset()
+                playlistName = ""
                 flowStep = .review
             }
         }
     }
 
-    private var configureBody: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                Text("Add to Library & Create Playlist")
-                    .font(.title2.bold())
-                Spacer()
-                Button("Back to Review") {
-                    transactionModel.reset()
-                    flowStep = .review
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Review summary")
-                    .font(.headline)
-                Text("\(importModel.resolutions.count) recordings, all resolved to exact Apple Music catalog IDs.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                if unresolvedCount > 0 {
-                    Label("\(unresolvedCount) line(s) still need review — the transaction cannot run until every line is confirmed.",
-                          systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
-                        .font(.callout)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Playlist")
-                    .font(.headline)
-                TextField("Playlist name", text: $playlistName)
-                    .textFieldStyle(.roundedBorder)
-                Toggle("Create the playlist if no playlist with this exact name exists",
-                       isOn: $createIfMissing)
-                    .font(.callout)
-                Text("If a playlist with the same name already exists it is used as-is and only provably-safe appends are made; it is never cleared or reordered.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            HStack {
-                if !canStart, unresolvedCount > 0 {
-                    Text("Resolve every line first")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
-                Spacer()
-                Button("Start Import") {
-                    flowStep = .run
-                    Task {
-                        transactionModel.playlistName = playlistName
-                        transactionModel.createIfMissing = createIfMissing
-                        await transactionModel.start(resolutions: importModel.resolutions)
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!canStart)
-            }
-        }
-        .padding(20)
-        .frame(minWidth: 560, minHeight: 420, alignment: .topLeading)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onAppear {
-            if playlistName.isEmpty { playlistName = defaultPlaylistName }
-        }
-    }
-
-    private var defaultPlaylistName: String {
-        "Tunory Import \(Self.dateStamp())"
-    }
-
-    private static func dateStamp() -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: Date())
-    }
-
-    private var unresolvedCount: Int {
-        importModel.resolutions
-            .filter { $0.status != .resolved }
-            .count
-    }
-
     private var canStart: Bool {
-        !importModel.resolutions.isEmpty
-            && unresolvedCount == 0
-            && authModel.state == .authorized
-            && !playlistName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        importModel.canContinueReview
+        && !writeActionInFlight && !importModel.isBusy && !transactionModel.isRunning && !recoveryModel.isRunning
+        && authModel.state == .authorized
+        && !playlistName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    // MARK: - Status screen
+    private var configureBody: some View {
+        TunoryScreen {
+            TunoryNotice(title: "Ready to build your playlist", message: "Review is read-only. Nothing changes until you confirm Start Import.", symbol: "checklist")
+            GroupBox("Confirmed recordings") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("\(importModel.resolutions.count) recordings in the reviewed order")
+                    Text("Exact Apple Music catalog identities will be used. Existing playlist tracks are never cleared or reordered.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox("Target playlist") {
+                VStack(alignment: .leading, spacing: 12) {
+                    TextField("Playlist name", text: $playlistName)
+                        .textFieldStyle(.roundedBorder).accessibilityIdentifier("configure.playlistName")
+                        .accessibilityLabel("Playlist name")
+                    Toggle("Create the playlist if no exact name matches", isOn: $createIfMissing)
+                        .accessibilityIdentifier("configure.createIfMissing")
+                    Text(createIfMissing
+                         ? "A new playlist may be created. If one exact-name playlist exists, Tunory uses it only when fresh reads prove safe appends."
+                         : "Tunory stops if there is no exact-name playlist. Multiple matches or an unsafe playlist always stop the import.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            TunoryNotice(title: "This action changes Apple Music", message: "Tunory may add missing recordings to your library and append them to the target playlist. Each phase is checked with fresh reads. Partial progress may remain if Apple Music stops responding.", symbol: "exclamationmark.triangle")
+            if authModel.state != .authorized {
+                Button("Review Apple Music Access") { selectedTab = .status }
+                    .accessibilityIdentifier("configure.authorization")
+            }
+            if recoveryModel.isRunning {
+                Text("Recovery is running. Wait for it to finish before starting another import.")
+            }
+            TunoryActions {
+                Button("Start Import") { showWriteConfirmation = true }
+                    .buttonStyle(.borderedProminent).disabled(!canStart)
+                    .accessibilityIdentifier("configure.start")
+                Button("Back to Review") { flowStep = .review }
+                    .buttonStyle(.bordered).accessibilityIdentifier("configure.back")
+            }
+        }
+        .onAppear {
+            if playlistName.isEmpty {
+                playlistName = "Tunory Import \(Date().formatted(.iso8601.year().month().day().dateSeparator(.dash)))"
+            }
+        }
+        .confirmationDialog("Start this Apple Music import?", isPresented: $showWriteConfirmation, titleVisibility: .visible) {
+            Button("Start Import") {
+                refreshAuthorization()
+                guard canStart else { return }
+                transactionModel.playlistName = playlistName
+                transactionModel.createIfMissing = createIfMissing
+                let reviewed = importModel.resolutions
+                writeActionInFlight = true
+                flowStep = .run
+                Task {
+                    defer { writeActionInFlight = false }
+                    await transactionModel.start(resolutions: reviewed)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Add missing recordings to your library and append \(importModel.resolutions.count) reviewed recordings to “\(playlistName)”. Existing tracks will not be removed or reordered. Playlist creation is \(createIfMissing ? "enabled" : "disabled").")
+        }
+    }
+
+    private func resumeRecovery() {
+        refreshAuthorization()
+        guard authModel.state == .authorized, !writeActionInFlight,
+              !transactionModel.isRunning, !importModel.isBusy else { return }
+        writeActionInFlight = true
+        Task {
+            defer { writeActionInFlight = false }
+            await recoveryModel.resume()
+        }
+    }
 
     private var statusBody: some View {
-        VStack(spacing: 16) {
-            Text("Tunory")
-                .font(.largeTitle)
-
-            Text(statusText)
-
-            if authModel.state == .notDetermined || authModel.state == .denied {
-                Button("Enable Apple Music Access") {
-                    Task { await authModel.requestAuthorization() }
-                }
+        TunoryScreen {
+            GroupBox("Apple Music access") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label(authorizationTitle, systemImage: authModel.state == .authorized ? "checkmark.shield" : "lock")
+                        .font(.headline).accessibilityIdentifier("status.authorization")
+                    Text(authorizationDescription).foregroundStyle(.secondary)
+                    if authModel.state == .notDetermined {
+                        Button("Enable Apple Music Access") { Task { await authModel.requestAuthorization() } }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(authModel.isRequestingAuthorization || authModel.isTestingConnectivity)
+                            .accessibilityIdentifier("status.requestAccess")
+                    }
+                    if authModel.isRequestingAuthorization { ProgressView("Waiting for authorization…") }
+                    if authModel.state != .authorized && authModel.state != .notDetermined && authModel.state != .unknown {
+                        Button("Refresh Access Status", action: refreshAuthorization)
+                            .accessibilityIdentifier("status.refreshAccess")
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
             }
-
-            if authModel.state == .authorized {
-                Text("Connectivity: \(authModel.connectivity)")
-                    .font(.footnote)
+            GroupBox("Catalog connectivity · read-only") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(authModel.connectivity.description).accessibilityIdentifier("status.connectivity")
+                    Text("This checks a catalog request. It does not verify library access or playlist writes.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    if authModel.isTestingConnectivity { ProgressView("Checking connectivity…") }
+                    Button(authModel.connectivity == .notTested ? "Test Connectivity" : "Test Again") {
+                        Task { await authModel.runConnectivityCheck() }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(authModel.state != .authorized || authModel.isTestingConnectivity || authModel.isRequestingAuthorization)
+                    .accessibilityIdentifier("status.testConnectivity")
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if recoveryModel.hasPending || recoveryModel.isRunning {
+                TunoryNotice(title: "Saved import progress", message: "Review the checkpoint before starting another import. Opening Recovery does not write to Apple Music.", symbol: "arrow.clockwise")
+                Button("Review Saved Progress") { selectedTab = .recovery }
+                    .buttonStyle(.bordered).accessibilityIdentifier("status.openRecovery")
+            }
+            Button("Import a Song List") { selectedTab = .importReview }
+                .buttonStyle(.borderedProminent).controlSize(.large).accessibilityIdentifier("status.openImport")
+            DisclosureGroup("How Tunory imports music") {
+                Text("Import a song list, confirm exact recordings, and review every change before writing to Apple Music.")
                     .foregroundStyle(.secondary)
-                Button("Test Connectivity") {
-                    Task { await authModel.runConnectivityCheck() }
-                }
-                .disabled(authModel.isTestingConnectivity)
-            }
-
-            // Recovery state is visible at launch: a persisted interrupted
-            // transaction is surfaced here too, with an explicit jump to
-            // the Recovery tab (no automatic action).
-            if recoveryModel.hasPending {
-                Label("An interrupted import can be resumed or dismissed on the Recovery tab.",
-                      systemImage: "arrow.trianglehead.2.clockwise.rotatepath")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-                Button("Open Recovery") { selectedTab = .recovery }
             }
         }
-        .padding(32)
-        .frame(minWidth: 420, minHeight: 240)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var statusText: String {
+    private var authorizationTitle: String {
         switch authModel.state {
-        case .unknown: return "Checking MusicKit authorization…"
-        case .notDetermined: return "MusicKit authorization has not been requested."
-        case .denied: return "Apple Music access denied. Grant access in System Settings."
-        case .restricted: return "Apple Music access is restricted on this device."
-        case .authorized: return "Apple Music access granted (read-only)."
-        case .failure(let msg): return "Error: \(msg)"
+        case .unknown: return String(localized: "Checking access")
+        case .notDetermined: return String(localized: "Access not requested")
+        case .denied: return String(localized: "Access denied")
+        case .restricted: return String(localized: "Access restricted")
+        case .authorized: return String(localized: "Access granted")
+        case .failure: return String(localized: "Could not determine access")
+        }
+    }
+
+    private var authorizationDescription: String {
+        switch authModel.state {
+        case .unknown: return String(localized: "Tunory is checking the current Apple Music permission.")
+        case .notDetermined: return String(localized: "Allow Apple Music access to resolve songs. Review and catalog checks do not change your library.")
+        case .denied:
+            #if os(macOS)
+            return String(localized: "Enable Tunory in System Settings → Privacy & Security → Media & Apple Music, then refresh.")
+            #else
+            return String(localized: "Enable Apple Music access for Tunory in Settings, then return here to refresh.")
+            #endif
+        case .restricted: return String(localized: "Device restrictions prevent Apple Music access. Review Screen Time or managed-device restrictions before trying again.")
+        case .authorized: return String(localized: "Permission is available. Connectivity and write verification are separate checks.")
+        case .failure(let detail): return detail
         }
     }
 }

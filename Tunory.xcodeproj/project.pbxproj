@@ -7,12 +7,19 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		B20000000000000000000001 /* TunoryCore in Test Frameworks */ = {isa = PBXBuildFile; productRef = A1F8DFB10000000000000002 /* TunoryCore */; };
 		A1F8DFB10000000000000003 /* TunoryCore in Frameworks */ = {isa = PBXBuildFile; productRef = A1F8DFB10000000000000002 /* TunoryCore */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		C20000000000000000000002 /* TunoryUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = TunoryUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		B20000000000000000000002 /* TunoryTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = TunoryTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		000000000000000000000120 /* Tunory.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Tunory.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
+
+/* Begin PBXContainerItemProxy section */
+		B20000000000000000000005 = {isa = PBXContainerItemProxy; containerPortal = 000000000000000000000000; proxyType = 1; remoteGlobalIDString = 000000000000000100000000; remoteInfo = Tunory; };
+/* End PBXContainerItemProxy section */
 
 /* Begin XCLocalSwiftPackageReference section */
 		A1F8DFB10000000000000000 /* Packages/TunoryCore */ = {isa = XCLocalSwiftPackageReference; relativePath = Packages/TunoryCore; };
@@ -23,6 +30,8 @@
 /* End XCSwiftPackageProductDependency section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		C20000000000000000000003 /* TunoryUITests */ = {isa = PBXFileSystemSynchronizedRootGroup; path = TunoryUITests; sourceTree = "<group>"; };
+		B20000000000000000000003 /* TunoryTests */ = {isa = PBXFileSystemSynchronizedRootGroup; path = TunoryTests; sourceTree = "<group>"; };
 		0FB408C23061EE400032CF83 /* Tunory */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = Tunory;
@@ -31,6 +40,8 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		C20000000000000000000004 = {isa = PBXFrameworksBuildPhase; files = (); };
+		B20000000000000000000004 /* Test Frameworks */ = {isa = PBXFrameworksBuildPhase; files = (B20000000000000000000001 /* TunoryCore in Test Frameworks */,); };
 		000000000000000130000000 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
@@ -43,6 +54,8 @@
 		000000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
+				B20000000000000000000003 /* TunoryTests */,
+				C20000000000000000000003 /* TunoryUITests */,
 				0FB408C23061EE400032CF83 /* Tunory */,
 				A1F8DFB10000000000000001 /* TunoryCore */,
 				000000000000000000000020 /* Products */,
@@ -53,6 +66,8 @@
 			isa = PBXGroup;
 			children = (
 				000000000000000000000120 /* Tunory.app */,
+				B20000000000000000000002 /* TunoryTests.xctest */,
+				C20000000000000000000002 /* TunoryUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -60,6 +75,31 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		C20000000000000000000006 /* TunoryUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C20000000000000000000007;
+			buildPhases = (C20000000000000000000008, C20000000000000000000004, C20000000000000000000009,);
+			buildRules = ();
+			dependencies = (B20000000000000000000010,);
+			fileSystemSynchronizedGroups = (C20000000000000000000003,);
+			name = TunoryUITests;
+			productName = TunoryUITests;
+			productReference = C20000000000000000000002;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		B20000000000000000000006 /* TunoryTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B20000000000000000000007;
+			buildPhases = (B20000000000000000000008, B20000000000000000000004, B20000000000000000000009,);
+			buildRules = ();
+			dependencies = (B20000000000000000000010,);
+			fileSystemSynchronizedGroups = (B20000000000000000000003,);
+			name = TunoryTests;
+			packageProductDependencies = (A1F8DFB10000000000000002,);
+			productName = TunoryTests;
+			productReference = B20000000000000000000002;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		000000000000000100000000 /* Tunory */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 000000000000000110000000 /* Build configuration list for PBXNativeTarget "Tunory" */;
@@ -114,11 +154,15 @@
 			projectRoot = "";
 			targets = (
 				000000000000000100000000 /* Tunory */,
+				B20000000000000000000006 /* TunoryTests */,
+				C20000000000000000000006 /* TunoryUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		C20000000000000000000009 = {isa = PBXResourcesBuildPhase; files = (); };
+		B20000000000000000000009 = {isa = PBXResourcesBuildPhase; files = (); };
 		000000000000000140000000 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
@@ -127,6 +171,8 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		C20000000000000000000008 = {isa = PBXSourcesBuildPhase; files = (); };
+		B20000000000000000000008 = {isa = PBXSourcesBuildPhase; files = (); };
 		000000000000000120000000 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			files = (
@@ -135,6 +181,72 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
+		C20000000000000000000011 /* UI Tests Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = DHJQ7QC53Z;
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.raelldottin.tunory.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "macosx iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Tunory;
+			};
+			name = Debug;
+		};
+		C20000000000000000000012 /* UI Tests Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = DHJQ7QC53Z;
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.raelldottin.tunory.uitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "macosx iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Tunory;
+			};
+			name = Release;
+		};
+		B20000000000000000000011 /* Tests Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = DHJQ7QC53Z;
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.raelldottin.tunory.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "macosx iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Tunory.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Tunory";
+			};
+			name = Debug;
+		};
+		B20000000000000000000012 /* Tests Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = DHJQ7QC53Z;
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.raelldottin.tunory.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "macosx iphoneos iphonesimulator";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Tunory.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Tunory";
+			};
+			name = Release;
+		};
 		000000000000000011000000 /* Debug configuration for PBXProject "Tunory" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -356,6 +468,8 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		C20000000000000000000007 = {isa = XCConfigurationList; buildConfigurations = (C20000000000000000000011, C20000000000000000000012,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		B20000000000000000000007 = {isa = XCConfigurationList; buildConfigurations = (B20000000000000000000011, B20000000000000000000012,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		000000000000000010000000 /* Build configuration list for PBXProject "Tunory" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -373,6 +487,10 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin PBXTargetDependency section */
+		B20000000000000000000010 = {isa = PBXTargetDependency; target = 000000000000000100000000; targetProxy = B20000000000000000000005; };
+/* End PBXTargetDependency section */
 	};
 	rootObject = 000000000000000000000000 /* Project object */;
 }
