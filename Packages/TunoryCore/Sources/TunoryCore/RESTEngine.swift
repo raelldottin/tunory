@@ -27,19 +27,44 @@ public final class RESTEngine: Sendable {
         public var propagateDelayMilliseconds: Int
         public var verificationRetries: Int
         public var verificationBackoffMilliseconds: Int
+        /// Dedicated budget for the post-append stored-prefix proof (§14).
+        /// Separate from `verificationRetries`, which keeps its small value
+        /// for library verification (§11) — the post-append read is the one
+        /// exposed to iCloud eventual-consistency lag (observed ~60s in the
+        /// live run-71 defect), so it needs read-your-own-writes patience:
+        /// 45 attempts × 2s = ~90s, covering the observed lag with margin.
+        /// Only the patience grows; a write that never becomes provable
+        /// still STOPs (§20).
+        public var appendVerificationRetries: Int
+        public var appendVerificationBackoffMilliseconds: Int
+        /// Dedicated budget for re-discovering a playlist after a proven
+        /// 201 create (run-69 defect): the created playlist may not appear
+        /// in the library listing for tens of seconds. 45 × 2s ≈ 90s.
+        /// Only `.playlistNotFound` is retried — ambiguity, notEditable and
+        /// unsafe states remain immediate §20 stops.
+        public var createRediscoveryRetries: Int
+        public var createRediscoveryBackoffMilliseconds: Int
 
         public init(storefront: String = "us",
                     maxLibraryPages: Int = 1000,
                     maxPlaylistPages: Int = 200,
                     propagateDelayMilliseconds: Int = 500,
                     verificationRetries: Int = 3,
-                    verificationBackoffMilliseconds: Int = 1000) {
+                    verificationBackoffMilliseconds: Int = 1000,
+                    appendVerificationRetries: Int = 45,
+                    appendVerificationBackoffMilliseconds: Int = 2000,
+                    createRediscoveryRetries: Int = 45,
+                    createRediscoveryBackoffMilliseconds: Int = 2000) {
             self.storefront = storefront
             self.maxLibraryPages = maxLibraryPages
             self.maxPlaylistPages = maxPlaylistPages
             self.propagateDelayMilliseconds = propagateDelayMilliseconds
             self.verificationRetries = verificationRetries
             self.verificationBackoffMilliseconds = verificationBackoffMilliseconds
+            self.appendVerificationRetries = appendVerificationRetries
+            self.appendVerificationBackoffMilliseconds = appendVerificationBackoffMilliseconds
+            self.createRediscoveryRetries = createRediscoveryRetries
+            self.createRediscoveryBackoffMilliseconds = createRediscoveryBackoffMilliseconds
         }
     }
 
@@ -359,6 +384,31 @@ public final class RESTEngine: Sendable {
                    missingCatalogIds: RESTEngine.missingSuffix(state: state, manifest: manifest))
     }
 
+    /// Full preflight re-run after a proven 201 create (run-69 defect):
+    /// iCloud eventual consistency may leave a freshly created playlist
+    /// absent from the library listing for tens of seconds, so a single
+    /// re-read can observe `.playlistNotFound` right after a proven
+    /// create. ONLY not-found is retried, within the dedicated bounded
+    /// budget — ambiguity, notEditable and unsafe states remain immediate
+    /// §20 stops, and a lag exceeding the budget still STOPs: success is
+    /// never fabricated from the 201 acknowledgment.
+    public func preflightAfterCreate(named exactName: String,
+                                     manifest: ParsedManifest,
+                                     onRetry: ((Int, Int) -> Void)? = nil) async -> PlaylistPreflightResult {
+        let maxAttempts = max(1, config.createRediscoveryRetries)
+        var attempt = 0
+        while true {
+            attempt += 1
+            let result = await preflightPlaylist(named: exactName, manifest: manifest)
+            if case .stop(.playlistNotFound) = result, attempt < maxAttempts {
+                onRetry?(attempt, maxAttempts)
+                try? await Task.sleep(nanoseconds: UInt64(config.createRediscoveryBackoffMilliseconds) * 1_000_000)
+                continue
+            }
+            return result
+        }
+    }
+
     // MARK: - Plan derivation
 
     /// Derives the immutable append plan: the manifest suffix after the
@@ -481,7 +531,7 @@ public final class RESTEngine: Sendable {
     private func verifyStoredPrefix(playlistId: String,
                                     manifest: ParsedManifest,
                                     expectedCount: Int) async throws -> Void {
-        let maxAttempts = max(1, config.verificationRetries)
+        let maxAttempts = max(1, config.appendVerificationRetries)
         var attempt = 0
         var lastState: PlaylistState?
         while attempt < maxAttempts {
@@ -494,7 +544,7 @@ public final class RESTEngine: Sendable {
                     throw AMError.playlistVerificationFailed(
                         reason: "after appending \(expectedCount) tracks, tracks read failed: \(String(describing: error))")
                 }
-                try? await Task.sleep(nanoseconds: UInt64(config.verificationBackoffMilliseconds) * 1_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(config.appendVerificationBackoffMilliseconds) * 1_000_000)
                 continue
             }
             let state = RESTEngine.classifyPlaylist(tracks: tracks, manifest: manifest)
@@ -506,7 +556,7 @@ public final class RESTEngine: Sendable {
                 return
             default:
                 if attempt < maxAttempts {
-                    try? await Task.sleep(nanoseconds: UInt64(config.verificationBackoffMilliseconds) * 1_000_000)
+                    try? await Task.sleep(nanoseconds: UInt64(config.appendVerificationBackoffMilliseconds) * 1_000_000)
                 }
             }
         }

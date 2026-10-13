@@ -36,13 +36,17 @@ final class Phase9ScenarioTests: XCTestCase {
     private func makeRunner(_ transport: StubTransport) -> TransactionRunner {
         TransactionRunner(engine: RESTEngine(transport: transport, config: .init(
             storefront: "us", propagateDelayMilliseconds: 0,
-            verificationRetries: 3, verificationBackoffMilliseconds: 0)))
+            verificationRetries: 3, verificationBackoffMilliseconds: 0,
+            appendVerificationRetries: 3, appendVerificationBackoffMilliseconds: 0,
+            createRediscoveryRetries: 3, createRediscoveryBackoffMilliseconds: 0)))
     }
 
     private func makeEngine(_ transport: StubTransport) -> RESTEngine {
         RESTEngine(transport: transport, config: .init(
             storefront: "us", propagateDelayMilliseconds: 0,
-            verificationRetries: 3, verificationBackoffMilliseconds: 0))
+            verificationRetries: 3, verificationBackoffMilliseconds: 0,
+            appendVerificationRetries: 3, appendVerificationBackoffMilliseconds: 0,
+            createRediscoveryRetries: 3, createRediscoveryBackoffMilliseconds: 0))
     }
 
     private func tempDirectory() -> URL {

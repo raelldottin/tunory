@@ -76,7 +76,9 @@ final class UIValidationContext {
     }
 
     func makeEngine() -> RESTEngine {
-        RESTEngine(transport: transport, config: .init(propagateDelayMilliseconds: 0, verificationRetries: 1, verificationBackoffMilliseconds: 0))
+        RESTEngine(transport: transport, config: .init(propagateDelayMilliseconds: 0, verificationRetries: 1, verificationBackoffMilliseconds: 0,
+                                                      appendVerificationRetries: 1, appendVerificationBackoffMilliseconds: 0,
+                                                      createRediscoveryRetries: 1, createRediscoveryBackoffMilliseconds: 0))
     }
 }
 

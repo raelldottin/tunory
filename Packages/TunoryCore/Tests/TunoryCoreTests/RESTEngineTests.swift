@@ -11,7 +11,11 @@ final class RESTEngineTests: XCTestCase {
             maxPlaylistPages: 20,
             propagateDelayMilliseconds: 0,
             verificationRetries: 3,
-            verificationBackoffMilliseconds: 0))
+            verificationBackoffMilliseconds: 0,
+            appendVerificationRetries: 3,
+            appendVerificationBackoffMilliseconds: 0,
+            createRediscoveryRetries: 3,
+            createRediscoveryBackoffMilliseconds: 0))
     }
 
     // MARK: - §13 classification (pure, exhaustive over safe/unsafe states)
@@ -644,15 +648,12 @@ final class RESTEngineTests: XCTestCase {
                                                     playlistName: "Target",
                                                     libraryHas: [101, 102])
         transport.appendsMutateTracks = false   // server "delays" visibility
-        // Simulate lag: the first append's verification read sees the old
-        // (empty) state once, then the write becomes visible.
         var appendCount = 0
         transport.appendHook = { playlistId, librarySongId in
             appendCount += 1
             if let song = transport.librarySongsById[librarySongId] {
                 transport.playlistTracks[playlistId, default: []].append(song)
             }
-            // Lag only the first append: one stale read, then visible.
             transport.appendVisibilityLag = (appendCount == 1) ? 1 : 0
             return 204
         }
@@ -665,6 +666,92 @@ final class RESTEngineTests: XCTestCase {
         let outcomes = try await engine.executeAppendPlan(plan)
         XCTAssertEqual(outcomes.count, 2)
         XCTAssertEqual(transport.playlistTracks["p.test"]?.map(\.catalogId), [101, 102])
+    }
+
+    /// Run-71 regression: the post-append read may lag SEVERAL attempts
+    /// (iCloud eventual consistency, observed ~60s live) before the
+    /// stored prefix is provable. With a dedicated append-verification
+    /// budget, the engine keeps re-reading and eventually confirms —
+    /// the transaction advances only on proof, never on patience expiry.
+    func testExecutePlanConfirmsWhenAppendReadLagsSeveralAttempts() async throws {
+        let manifest = Fixtures.manifest(ids: [101, 102])
+        let transport = Fixtures.happyPathTransport(manifest: manifest,
+                                                    playlistName: "Target",
+                                                    libraryHas: [101, 102])
+        transport.appendsMutateTracks = false
+        var appendCount = 0
+        transport.appendHook = { playlistId, librarySongId in
+            appendCount += 1
+            if let song = transport.librarySongsById[librarySongId] {
+                transport.playlistTracks[playlistId, default: []].append(song)
+            }
+            // Lag the first append THREE reads deep — beyond the old
+            // library-verification budget, within the new append budget.
+            transport.appendVisibilityLag = (appendCount == 1) ? 3 : 0
+            return 204
+        }
+        let engine = RESTEngine(transport: transport, config: .init(
+            storefront: "us", maxLibraryPages: 100, maxPlaylistPages: 20,
+            propagateDelayMilliseconds: 0,
+            verificationRetries: 1, verificationBackoffMilliseconds: 0,
+            appendVerificationRetries: 5, appendVerificationBackoffMilliseconds: 0,
+            createRediscoveryRetries: 1, createRediscoveryBackoffMilliseconds: 0))
+        let preflight = await engine.preflightPlaylist(named: "Target", manifest: manifest)
+        let library = try await engine.enumerateLibrary()
+        let plan = try RESTEngine.deriveAppendPlan(preflight: preflight, manifest: manifest,
+                                                   library: library).get()
+
+        let outcomes = try await engine.executeAppendPlan(plan)
+        XCTAssertEqual(outcomes.count, 2)
+        XCTAssertEqual(transport.playlistTracks["p.test"]?.map(\.catalogId), [101, 102])
+    }
+
+    /// Property sweep (run-71 class): for every stale-read depth d from 0
+    /// to the append budget, verifyStoredPrefix either confirms (d within
+    /// budget) or STOPs with playlistVerificationFailed (d exceeds it) —
+    /// never advances on an unproven step, never fabricates success.
+    func testAppendVerificationBudgetBoundaryProperty() async throws {
+        let ids = [101, 102]
+        for d in 0...5 {
+            let manifest = Fixtures.manifest(ids: ids)
+            let transport = Fixtures.happyPathTransport(manifest: manifest,
+                                                        playlistName: "Target",
+                                                        libraryHas: ids)
+            transport.appendsMutateTracks = false
+            var appendCount = 0
+            transport.appendHook = { playlistId, librarySongId in
+                appendCount += 1
+                if let song = transport.librarySongsById[librarySongId] {
+                    transport.playlistTracks[playlistId, default: []].append(song)
+                }
+                transport.appendVisibilityLag = (appendCount == 1) ? d : 0
+                return 204
+            }
+            let budget = 4
+            let engine = RESTEngine(transport: transport, config: .init(
+                storefront: "us", maxLibraryPages: 100, maxPlaylistPages: 20,
+                propagateDelayMilliseconds: 0,
+                verificationRetries: 1, verificationBackoffMilliseconds: 0,
+                appendVerificationRetries: budget, appendVerificationBackoffMilliseconds: 0,
+                createRediscoveryRetries: 1, createRediscoveryBackoffMilliseconds: 0))
+            let preflight = await engine.preflightPlaylist(named: "Target", manifest: manifest)
+            let library = try await engine.enumerateLibrary()
+            let plan = try RESTEngine.deriveAppendPlan(preflight: preflight, manifest: manifest,
+                                                       library: library).get()
+
+            do {
+                let outcomes = try await engine.executeAppendPlan(plan)
+                XCTAssertTrue(d < budget, "depth \(d) must not confirm within budget \(budget)")
+                XCTAssertEqual(outcomes.count, 2)
+            } catch let error as AMError {
+                guard case .playlistVerificationFailed = error else {
+                    return XCTFail("depth \(d): unexpected error \(error)")
+                }
+                XCTAssertTrue(d >= budget, "depth \(d) within budget \(budget) must confirm, not stop")
+                XCTAssertEqual(transport.calls.filter { $0.name == "append" }.count, 1,
+                               "no second write after an unproven first")
+            }
+        }
     }
 
     /// A write that never becomes visible is a stop condition: execution

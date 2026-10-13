@@ -141,6 +141,85 @@ final class WorkflowSafetyTests: XCTestCase {
         XCTAssertEqual(store.load(), .none)
         XCTAssertNil(model.persistenceWarning)
     }
+
+    // MARK: - Stopped execute seeds recovery (run-71 follow-up)
+
+    /// A transaction that STOPs mid-execute (partial append outcomes) must
+    /// save a credential-free checkpoint, AND the Recovery surface must
+    /// show it after loadPersisted() — the run-71 "STOP did not seed
+    /// Recovery" report. When the save itself fails, the warning banner
+    /// is the only signal: it must be visible.
+    func testStoppedExecuteSeedsCheckpointAndRecoverySurfacesIt() async throws {
+        // Scripted server: catalog exists, playlist found and editable and
+        // empty, library add verified by fresh read, first append accepted
+        // (204) but never stored — the canonical engine stops with
+        // playlistVerificationFailed after 1 recorded append outcome.
+        actor LaggingWriteTransport: AMTransport {
+            func getCatalogSong(catalogId: Int, storefront: String) async throws
+                -> (song: AMCatalogSong?, httpStatus: Int) {
+                (AMCatalogSong(id: String(catalogId),
+                               attributes: .init(name: "One", artistName: "Test Artist",
+                                                 albumName: nil, durationInMillis: nil)), 200)
+            }
+            func getLibrarySongsPage(cursor: String?) async throws
+                -> (items: [AMLibrarySong], next: String?) {
+                ([AMLibrarySong(id: "l.101",
+                               attributes: .init(name: nil, artistName: nil,
+                                                 playParams: .init(catalogId: 101)),
+                               relationships: nil)], nil)
+            }
+            func getLibraryPlaylistsPage(cursor: String?) async throws
+                -> (items: [AMLibraryPlaylist], next: String?) {
+                ([AMLibraryPlaylist(id: "p.test",
+                                   attributes: .init(name: "Test", canEdit: true, shareUrl: nil))], nil)
+            }
+            func getPlaylistTracks(playlistId: String) async throws -> [AMLibrarySong] { [] }
+            func addCatalogSongToLibrary(catalogId: Int) async throws -> Int { 202 }
+            func appendLibrarySong(toPlaylist playlistId: String, librarySongId: String) async throws -> Int { 204 }
+            func createPlaylist(named name: String) async throws
+                -> (playlist: AMLibraryPlaylist?, httpStatus: Int) { (nil, 500) }
+        }
+        let transport = LaggingWriteTransport()
+        let store = try self.store()
+        // Pin the engine's patience budgets so the scripted failure is
+        // observed immediately (the production default is 45 × 2s, which
+        // is exactly what the core property test covers instead).
+        let fastConfig = RESTEngine.Config(propagateDelayMilliseconds: 0,
+                                           verificationRetries: 1, verificationBackoffMilliseconds: 0,
+                                           appendVerificationRetries: 1, appendVerificationBackoffMilliseconds: 0,
+                                           createRediscoveryRetries: 1, createRediscoveryBackoffMilliseconds: 0)
+        let model = TransactionViewModel(checkpointStore: store,
+                                         authorizationStatus: { .authorized },
+                                         makeEngine: { RESTEngine(transport: transport, config: fastConfig) })
+        model.playlistName = "Test"
+        await model.start(resolutions: [recording()])
+        XCTAssertEqual(model.stage, .finished)
+        XCTAssertFalse(model.report?.succeeded ?? true, "the scripted lag must stop the run")
+
+        // The stopped execute saved a checkpoint...
+        guard case .checkpoint(let saved) = store.load() else {
+            return XCTFail("stopped execute must seed a checkpoint, got \(store.load())")
+        }
+        XCTAssertEqual(saved.playlistName, "Test")
+        // ...and Recovery surfaces it after an explicit loadPersisted().
+        let recovery = RecoveryViewModel(store: store)
+        recovery.loadPersisted()
+        XCTAssertEqual(recovery.stage, .available(checkpoint: saved))
+
+        // Adversarial: when the save itself fails (read-only directory),
+        // persistenceWarning must carry the signal.
+        let blockedStore = try self.store()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: blockedStore.directory.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: blockedStore.directory.path) }
+        let blockedModel = TransactionViewModel(checkpointStore: blockedStore,
+                                                authorizationStatus: { .authorized },
+                                                makeEngine: { RESTEngine(transport: transport, config: fastConfig) })
+        blockedModel.playlistName = "Test"
+        await blockedModel.start(resolutions: [recording()])
+        XCTAssertEqual(blockedModel.stage, .finished)
+        XCTAssertNotNil(blockedModel.persistenceWarning,
+                        "a failed checkpoint save must surface the warning banner")
+    }
 }
 
 /// Every network operation is a fake. Read failure stops the canonical workflow;

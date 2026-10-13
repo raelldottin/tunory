@@ -25,6 +25,13 @@ public struct AMCatalogSong: Decodable, Equatable, Sendable {
         public let artistName: String?
         public let albumName: String?
         public let durationInMillis: Int?
+
+        public init(name: String?, artistName: String?, albumName: String?, durationInMillis: Int?) {
+            self.name = name
+            self.artistName = artistName
+            self.albumName = albumName
+            self.durationInMillis = durationInMillis
+        }
     }
 
     public init(id: String, attributes: Attributes?) {
@@ -44,6 +51,12 @@ public struct AMLibrarySong: Decodable, Equatable, Sendable {
         public let name: String?
         public let artistName: String?
         public let playParams: PlayParams?
+
+        public init(name: String?, artistName: String?, playParams: PlayParams?) {
+            self.name = name
+            self.artistName = artistName
+            self.playParams = playParams
+        }
     }
 
     public struct PlayParams: Decodable, Equatable, Sendable {
@@ -112,6 +125,12 @@ public struct AMLibraryPlaylist: Decodable, Equatable, Sendable {
         public let name: String?
         public let canEdit: Bool?
         public let shareUrl: String?
+
+        public init(name: String?, canEdit: Bool?, shareUrl: String?) {
+            self.name = name
+            self.canEdit = canEdit
+            self.shareUrl = shareUrl
+        }
     }
 
     public init(id: String, attributes: Attributes?) {
