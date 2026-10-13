@@ -23,6 +23,7 @@ final class TransactionViewModel: ObservableObject {
     }
 
     @Published private(set) var stage: Stage = .ready
+    @Published private(set) var persistenceWarning: String?
     /// Phase outcomes, insertion-sorted by `ordinal` so display order is
     /// deterministic regardless of task-hop arrival order.
     @Published private(set) var phaseLog: [TransactionPhaseOutcome] = []
@@ -46,11 +47,18 @@ final class TransactionViewModel: ObservableObject {
     /// Phase 9 persistence: where an interrupted execute's checkpoint is
     /// saved so the GUI recovery card can pick it up (across relaunch too).
     private let checkpointStore: CheckpointStore
+    private let authorizationStatus: () -> MusicAuthorization.Status
+    private let makeEngine: () -> RESTEngine
+    private var runID = UUID()
 
     var isRunning: Bool { stage == .running }
 
-    init(checkpointStore: CheckpointStore = CheckpointStore(directory: CheckpointStore.defaultDirectory())) {
+    init(checkpointStore: CheckpointStore = CheckpointStore(directory: CheckpointStore.defaultDirectory()),
+         authorizationStatus: @escaping () -> MusicAuthorization.Status = { MusicAuthorization.currentStatus },
+         makeEngine: @escaping () -> RESTEngine = { RESTEngine(transport: MusicDataRequestTransport()) }) {
         self.checkpointStore = checkpointStore
+        self.authorizationStatus = authorizationStatus
+        self.makeEngine = makeEngine
     }
 
     // MARK: - Entry
@@ -60,14 +68,27 @@ final class TransactionViewModel: ObservableObject {
     /// unresolved lines) — the view gates the button; the model still
     /// fail-closes via ManifestParser.build on any gap.
     func start(resolutions: [LineResolution]) async {
-        guard stage != .running else { return }
-        guard MusicAuthorization.currentStatus == .authorized else {
+        guard stage == .ready else { return }
+        phaseLog = []
+        report = nil
+        rows = []
+        failureMessage = nil
+        failurePosition = nil
+        divergenceNotes = []
+        persistenceWarning = nil
+        guard authorizationStatus() == .authorized else {
             failureMessage = "Apple Music access is required. Enable it on the Status screen first."
             failurePosition = nil
             stage = .finished
             return
         }
         let name = playlistName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !resolutions.isEmpty, resolutions.allSatisfy({ $0.status == .resolved }) else {
+            failureMessage = String(localized: "Confirm every recording before starting an import.")
+            failurePosition = resolutions.first(where: { $0.status != .resolved })?.pos
+            stage = .finished
+            return
+        }
         guard !name.isEmpty else {
             failureMessage = "Enter a playlist name."
             failurePosition = nil
@@ -106,7 +127,9 @@ final class TransactionViewModel: ObservableObject {
         failurePosition = nil
         divergenceNotes = []
 
-        let engine = RESTEngine(transport: MusicDataRequestTransport())
+        let id = UUID()
+        runID = id
+        let engine = makeEngine()
         let runner = TransactionRunner(engine: engine)
         let outcome = await runner.run(manifest: manifest,
                                        playlistName: name,
@@ -114,9 +137,11 @@ final class TransactionViewModel: ObservableObject {
             // Hop to the UI actor; ordinal insertion keeps order
             // deterministic even if hops were delivered out of order.
             Task { @MainActor in
-                self?.insert(phase)
+                    guard let self, self.runID == id, self.isRunning else { return }
+                    self.insert(phase)
             }
         }
+        phaseLog = outcome.phases.sorted { $0.ordinal < $1.ordinal }
         report = outcome
         rows = Self.deriveRows(resolutions: resolutions, report: outcome)
 
@@ -136,11 +161,18 @@ final class TransactionViewModel: ObservableObject {
            let checkpoint = TransactionRunner.checkpoint(
             forInterruptedExecuteIn: outcome,
             capturedAtMillisSinceEpoch: Int64(Date().timeIntervalSince1970 * 1000)) {
-            try? checkpointStore.save(checkpoint)
+            do {
+                try checkpointStore.save(checkpoint)
+            } catch {
+                persistenceWarning = String(localized: "The import stopped, but its recovery checkpoint could not be saved: \(error.localizedDescription). Keep the result evidence before closing Tunory.")
+            }
         } else if outcome.succeeded, let readback = outcome.finalReadback {
-            _ = checkpointStore.clearIfSuperseded(
+            let cleared = checkpointStore.clearIfSuperseded(
                 bySuccessWith: Self.playlistId(in: outcome, verification: readback),
                 manifestCatalogIds: manifest.entries.map(\.catalogId))
+            if !cleared, checkpointStore.load() != .none {
+                persistenceWarning = String(localized: "This import is verified, but a saved checkpoint remains. Review Recovery before dismissing it.")
+            }
         }
         stage = .finished
     }
@@ -158,6 +190,9 @@ final class TransactionViewModel: ObservableObject {
     }
 
     func reset() {
+        guard !isRunning else { return }
+        runID = UUID()
+        persistenceWarning = nil
         stage = .ready
         phaseLog = []
         report = nil
@@ -170,6 +205,7 @@ final class TransactionViewModel: ObservableObject {
     // MARK: - Derived presentation (pure)
 
     private func insert(_ phase: TransactionPhaseOutcome) {
+        guard !phaseLog.contains(where: { $0.ordinal == phase.ordinal }) else { return }
         if let index = phaseLog.firstIndex(where: { $0.ordinal > phase.ordinal }) {
             phaseLog.insert(phase, at: index)
         } else {
@@ -212,13 +248,18 @@ final class TransactionViewModel: ObservableObject {
             // Final read-back verdict when the transaction reached it.
             if let readback = report.finalReadback,
                readback.expectedCatalogIds.indices.contains(line.pos - 1) {
-                let actual = readback.actualCatalogIds[line.pos - 1]
+                let hasStoredPosition = readback.actualCatalogIds.indices.contains(line.pos - 1)
+                let actual = hasStoredPosition ? readback.actualCatalogIds[line.pos - 1] : nil
                 let expected = readback.expectedCatalogIds[line.pos - 1]
                 if actual != expected {
                     if problem == nil {
-                        problem = actual == nil
-                            ? "Position \(line.pos) stores an unidentifiable track."
-                            : "Position \(line.pos) stores catalog ID \(actual!), expected \(expected)."
+                        if !hasStoredPosition {
+                            problem = String(localized: "Position \(line.pos) has no stored track.")
+                        } else if let actual {
+                            problem = String(localized: "Position \(line.pos) stores catalog ID \(actual), expected \(expected).")
+                        } else {
+                            problem = String(localized: "Position \(line.pos) stores an unidentifiable track.")
+                        }
                     }
                 }
             }
@@ -228,8 +269,8 @@ final class TransactionViewModel: ObservableObject {
                 title: line.resolvedSong?.title ?? line.rawTitle,
                 artist: line.resolvedSong?.artistName ?? "",
                 catalogId: catalogId,
-                libraryAdded: addByPos[line.pos] != nil,
-                appended: appendByPos[line.pos] != nil,
+                libraryAdded: addByPos[line.pos]?.ok == true,
+                appended: appendByPos[line.pos]?.ok == true,
                 verified: report.finalReadback.map { readback in
                     readback.actualCatalogIds.indices.contains(line.pos - 1)
                         && readback.actualCatalogIds[line.pos - 1] == catalogId

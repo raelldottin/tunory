@@ -85,6 +85,13 @@ public struct CheckpointStore: Sendable {
         try? FileManager.default.removeItem(at: fileURL)
     }
 
+    /// UI callers must distinguish an absent checkpoint from a failed deletion.
+    /// Keep the existing best-effort clear API for callers that do not report it.
+    public func clearReportingFailure() throws {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        try FileManager.default.removeItem(at: fileURL)
+    }
+
     /// Clears the stored checkpoint when a VERIFIED success proves the
     /// transaction it describes is complete. Strict identity: only the same
     /// playlist AND the same manifest sequence are superseded — a success
@@ -98,7 +105,11 @@ public struct CheckpointStore: Sendable {
               existing.manifestCatalogIds == manifestCatalogIds else {
             return false
         }
-        clear()
-        return true
+        do {
+            try clearReportingFailure()
+            return true
+        } catch {
+            return false
+        }
     }
 }

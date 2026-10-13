@@ -10,7 +10,7 @@ struct MusicKitSources {
     /// Builds engine sources over the live catalog. Requires the
     /// MusicKit authorization to already be granted; callers must check
     /// MusicAuthorization.currentStatus first (Phase 1 invariant).
-    static func make() -> ResolutionEngine.Sources {
+    static func make(onFailure: @escaping @Sendable (String) async -> Void = { _ in }) -> ResolutionEngine.Sources {
         var sources = ResolutionEngine.Sources()
 
         sources.resolveIds = { ids in
@@ -37,6 +37,7 @@ struct MusicKitSources {
                 } catch {
                     // Network/availability errors surface as "unresolved";
                     // the review UI can retry. Never fabricate data.
+                    await onFailure(error.localizedDescription)
                     continue
                 }
             }
@@ -62,6 +63,7 @@ struct MusicKitSources {
                                   durationMilliseconds: song.duration.map { Int($0 * 1000) })
                 }
             } catch {
+                await onFailure(error.localizedDescription)
                 return []
             }
         }
@@ -70,13 +72,13 @@ struct MusicKitSources {
     }
 
     /// MusicKit's Song.id.rawValue is the catalog id string.
-    private static func songCatalogId(_ song: Song) -> Int {
+    nonisolated private static func songCatalogId(_ song: Song) -> Int {
         Int(song.id.rawValue) ?? 0
     }
 }
 
 extension Array {
-    fileprivate func chunked(into size: Int) -> [[Element]] {
+    nonisolated fileprivate func chunked(into size: Int) -> [[Element]] {
         guard size > 0 else { return [self] }
         return stride(from: 0, to: count, by: size).map {
             Array(self[$0..<Swift.min($0 + size, count)])

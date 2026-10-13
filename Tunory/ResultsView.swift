@@ -9,7 +9,7 @@ struct ResultsView: View {
     let onRestart: () -> Void
 
     var body: some View {
-        ScrollView {
+        TunoryScreen {
             VStack(alignment: .leading, spacing: 16) {
                 header
                 if let report = model.report {
@@ -24,16 +24,18 @@ struct ResultsView: View {
                         .foregroundStyle(.red)
                         .font(.callout)
                 }
+                if let warning = model.persistenceWarning {
+                    Label(warning, systemImage: "externaldrive.badge.exclamationmark")
+                        .textSelection(.enabled)
+                }
                 rows
             }
-            .padding(20)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(minWidth: 560, minHeight: 420)
     }
 
     private var header: some View {
-        HStack {
+        VStack(alignment: .leading, spacing: 12) {
             if let report = model.report {
                 Image(systemName: report.succeeded ? "checkmark.seal.fill" : "xmark.octagon")
                     .foregroundStyle(report.succeeded ? .green : .orange)
@@ -47,6 +49,9 @@ struct ResultsView: View {
             }
             Spacer()
             Button("Start Over", action: onRestart)
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .accessibilityIdentifier("results.restart")
         }
     }
 
@@ -66,9 +71,19 @@ struct ResultsView: View {
                     Text("Verified by a fresh read: \(readback.expectedCatalogIds.count) recordings, exact order, 0 duplicates.")
                         .font(.callout)
                 } else {
-                    Text("Final read-back did NOT verify: orderingPass=\(readback.orderingPass), duplicates=\(readback.duplicates), unexpected=\(readback.unexpectedCatalogIds), unidentifiable=\(readback.unidentifiableTrackCount).")
-                        .font(.callout)
-                        .foregroundStyle(.red)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("Final playlist verification failed", systemImage: "exclamationmark.triangle")
+                            .accessibilityIdentifier("results.verificationFailure")
+                        Text(readback.orderingPass ? "Recording order matches." : "Recording order does not match.")
+                        Text("Recordings with duplicates: \(readback.duplicates.count). Unidentifiable tracks: \(readback.unidentifiableTrackCount).")
+                        if !readback.duplicates.isEmpty {
+                            Text("Duplicated recording IDs: \(readback.duplicates.map(String.init).joined(separator: ", ")).")
+                        }
+                        if !readback.unexpectedCatalogIds.isEmpty {
+                            Text("Unexpected recording IDs: \(readback.unexpectedCatalogIds.map(String.init).joined(separator: ", ")).")
+                        }
+                        Text("Review the affected recordings before trying another import.")
+                    }.font(.callout).foregroundStyle(.red)
                 }
             }
             if let shareUrl = report.finalReadback?.shareUrl {
@@ -168,7 +183,7 @@ struct ResultsView: View {
     }
 }
 
-private struct ResultRow: View {
+struct ResultRow: View {
     let row: TrackResultRow
 
     var body: some View {
@@ -185,14 +200,14 @@ private struct ResultRow: View {
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
 
-                HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 8) {
                     if row.libraryAdded {
-                        Label("Added to Library", systemImage: "music.note.list")
+                        Label("Library add accepted", systemImage: "music.note.list")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                     if row.appended {
-                        Label("Appended", systemImage: "text.append")
+                        Label("Playlist append accepted", systemImage: "text.append")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -200,6 +215,12 @@ private struct ResultRow: View {
                         Label("Verified", systemImage: "checkmark.seal.fill")
                             .font(.caption2)
                             .foregroundStyle(.green)
+                    } else if row.verified == false {
+                        Label("Not verified", systemImage: "exclamationmark.circle")
+                            .font(.caption)
+                    } else {
+                        Label("Final verification not reached", systemImage: "circle.dotted")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                     if let problem = row.problem {
                         Label(problem, systemImage: "exclamationmark.triangle")
@@ -212,5 +233,6 @@ private struct ResultRow: View {
             Spacer()
         }
         .padding(.vertical, 8)
+        .accessibilityIdentifier("results.recording.\(row.pos)")
     }
 }

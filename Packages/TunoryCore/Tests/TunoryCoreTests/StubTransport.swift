@@ -52,6 +52,13 @@ final class StubTransport: AMTransport, @unchecked Sendable {
     var createdPlaylistResource: AMLibraryPlaylist?
     /// The id the stub's server-side state uses for a created playlist.
     let createdPlaylistId = "p.created"
+    /// When > 0 at the moment of a default (201) create, the created
+    /// playlist is hidden from the next N playlist-page reads — scripting
+    /// the run-69 iCloud propagation lag deterministically. Each read
+    /// that filters it out decrements the counter; after that the
+    /// playlist is discoverable like the real server.
+    var createVisibilityLag: Int = 0
+    private var createdPlaylistHiddenFor = 0
     /// When non-nil, called at the start of each full library enumeration
     /// (first page fetch) with the 1-based enumeration ordinal; returns
     /// the pages to serve for that enumeration. Deterministic retry tests.
@@ -144,7 +151,15 @@ final class StubTransport: AMTransport, @unchecked Sendable {
         record("playlistPage", cursor ?? "first")
         let index = cursor.map { Int($0) ?? 0 } ?? 0
         guard index < playlistPages.count else { return ([], nil) }
-        let items = playlistPages[index]
+        var items = playlistPages[index]
+        // Run-69 lag scripting: the created playlist may be absent from the
+        // next N playlist-page reads (iCloud eventual consistency).
+        withLock {
+            if createdPlaylistHiddenFor > 0 {
+                createdPlaylistHiddenFor -= 1
+                items = items.filter { $0.id != createdPlaylistId }
+            }
+        }
         let next = index + 1 < playlistPages.count ? String(index + 1) : nil
         return (items, next)
     }
@@ -206,6 +221,7 @@ final class StubTransport: AMTransport, @unchecked Sendable {
                 pages.append(last)
                 playlistPages = pages
             }
+            createdPlaylistHiddenFor = createVisibilityLag
         }
         return (resource, 201)
     }

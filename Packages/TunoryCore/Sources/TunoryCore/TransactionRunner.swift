@@ -233,7 +233,18 @@ public struct TransactionRunner: Sendable {
                 return stop(.playlistCreationFailed(httpStatus: created.httpStatus), at: .preflight)
             }
             emit(.preflight, "created playlist \(resource.id) (http \(created.httpStatus)) — re-discovering to prove identity")
-            preflight = await engine.preflightPlaylist(named: playlistName, manifest: manifest)
+            // Run-69 defect: a proven 201 create may not appear in the
+            // library listing for tens of seconds (iCloud eventual
+            // consistency). The engine retries ONLY not-found within its
+            // bounded rediscovery budget; every other stop stands.
+            var rediscoveryRetries = 0
+            preflight = await engine.preflightAfterCreate(named: playlistName, manifest: manifest) { attempt, max in
+                rediscoveryRetries = attempt
+                emit(.preflight, "created playlist not yet visible (attempt \(attempt)/\(max)) — waiting for iCloud propagation")
+            }
+            if rediscoveryRetries > 0 {
+                emit(.preflight, "created playlist became visible after \(rediscoveryRetries) re-discovery attempt(s)")
+            }
         }
         let playlist: PlaylistInfo
         let state: PlaylistState

@@ -37,6 +37,8 @@ final class RecoveryViewModel: ObservableObject {
     /// Exactly what the user is being asked to act on (from the fresh
     /// evidence, never guessed): resumed progress display state.
     @Published private(set) var stage: Stage = .idle
+    @Published private(set) var persistenceWarning: String?
+    @Published private(set) var alreadyComplete = false
     @Published private(set) var phaseLog: [TransactionPhaseOutcome] = []
     @Published private(set) var report: TransactionReport?
     @Published private(set) var recoveryFailure: String?
@@ -46,6 +48,8 @@ final class RecoveryViewModel: ObservableObject {
     /// Closure the view model uses to construct a live engine; injectable
     /// so previews/tests can drive a scripted transport.
     private let makeEngine: () -> RESTEngine
+    private let authorizationStatus: () -> MusicAuthorization.Status
+    private var runID = UUID()
 
     var isRunning: Bool { stage == .running }
 
@@ -60,14 +64,18 @@ final class RecoveryViewModel: ObservableObject {
     }
 
     init(store: CheckpointStore = CheckpointStore(directory: CheckpointStore.defaultDirectory()),
+         authorizationStatus: @escaping () -> MusicAuthorization.Status = { MusicAuthorization.currentStatus },
          makeEngine: @escaping () -> RESTEngine = { RESTEngine(transport: MusicDataRequestTransport()) }) {
         self.store = store
         self.makeEngine = makeEngine
+        self.authorizationStatus = authorizationStatus
     }
 
     /// Loads the persisted checkpoint slot at launch (or after any change).
     /// Read-only: touches nothing but the app's own checkpoint file.
     func loadPersisted() {
+        guard !isRunning else { return }
+        reset()
         switch store.load() {
         case .none:
             stage = .idle
@@ -82,8 +90,13 @@ final class RecoveryViewModel: ObservableObject {
     /// checkpoint (their call — Apple's state is untouched) and return to
     /// the normal flow.
     func dismiss() {
-        store.clear()
-        reset()
+        guard !isRunning else { return }
+        do {
+            try store.clearReportingFailure()
+            reset()
+        } catch {
+            persistenceWarning = String(localized: "Saved progress could not be dismissed: \(error.localizedDescription). The checkpoint is retained.")
+        }
     }
 
     /// Starts the canonical recovery: fresh reads, fail-closed decision,
@@ -91,12 +104,16 @@ final class RecoveryViewModel: ObservableObject {
     /// The user pressed Resume; the core still owns every write decision.
     func resume() async {
         guard case .available(let checkpoint) = stage else { return }
-        guard MusicAuthorization.currentStatus == .authorized else {
+        guard authorizationStatus() == .authorized else {
             recoveryFailure = "Apple Music access is required. Enable it on the Status screen first."
             stage = .finished
             return
         }
         stage = .running
+        let id = UUID()
+        runID = id
+        alreadyComplete = false
+        persistenceWarning = nil
         phaseLog = []
         report = nil
         recoveryFailure = nil
@@ -104,7 +121,10 @@ final class RecoveryViewModel: ObservableObject {
 
         let outcome = await RecoveryFlow.run(checkpoint: checkpoint,
                                              engine: makeEngine()) { [weak self] phase in
-            Task { @MainActor in self?.insert(phase) }
+            Task { @MainActor in
+                guard let self, self.runID == id, self.isRunning else { return }
+                self.insert(phase)
+            }
         }
 
         switch outcome.kind {
@@ -112,19 +132,27 @@ final class RecoveryViewModel: ObservableObject {
             // Fresh reads proved the playlist already matches the full
             // manifest: nothing to write, nothing to resume. Clear the
             // slot (superseded by reality) and say so.
-            store.clear()
+            alreadyComplete = true
+            clearSuperseded(checkpoint: checkpoint)
             recoveryFailure = nil
             report = nil
             stage = .finished
         case .resumed(let report):
             self.report = report
+            phaseLog = report.phases.sorted { $0.ordinal < $1.ordinal }
             rows = Self.deriveRows(manifest: outcome.manifest, report: report)
             // The resumed run targeted the checkpoint's transaction: clear
             // the slot only when that exact transaction verified.
             if report.succeeded {
-                _ = store.clearIfSuperseded(
-                    bySuccessWith: checkpoint.playlistId,
-                    manifestCatalogIds: outcome.manifest.entries.map(\.catalogId))
+                clearSuperseded(checkpoint: checkpoint)
+            } else if let updated = TransactionRunner.checkpoint(
+                forInterruptedExecuteIn: report,
+                capturedAtMillisSinceEpoch: Int64(Date().timeIntervalSince1970 * 1000)) {
+                do {
+                    try store.save(updated)
+                } catch {
+                    persistenceWarning = String(localized: "New recovery progress could not be saved: \(error.localizedDescription). The earlier checkpoint is retained; fresh reads are still required.")
+                }
             }
             stage = .finished
         case .stopped(let error):
@@ -136,6 +164,10 @@ final class RecoveryViewModel: ObservableObject {
     }
 
     func reset() {
+        guard !isRunning else { return }
+        runID = UUID()
+        alreadyComplete = false
+        persistenceWarning = nil
         stage = .idle
         phaseLog = []
         report = nil
@@ -145,7 +177,16 @@ final class RecoveryViewModel: ObservableObject {
 
     // MARK: - Derived presentation (pure)
 
+    private func clearSuperseded(checkpoint: TransactionCheckpoint) {
+        let cleared = store.clearIfSuperseded(bySuccessWith: checkpoint.playlistId,
+                                             manifestCatalogIds: checkpoint.manifestCatalogIds)
+        if !cleared, store.load() != .none {
+            persistenceWarning = String(localized: "The playlist is verified, but saved progress remains on disk. Review it before dismissing it.")
+        }
+    }
+
     private func insert(_ phase: TransactionPhaseOutcome) {
+        guard !phaseLog.contains(where: { $0.ordinal == phase.ordinal }) else { return }
         if let index = phaseLog.firstIndex(where: { $0.ordinal > phase.ordinal }) {
             phaseLog.insert(phase, at: index)
         } else {
@@ -171,15 +212,23 @@ final class RecoveryViewModel: ObservableObject {
                 title: entry.name,
                 artist: entry.artist,
                 catalogId: entry.catalogId,
-                libraryAdded: addByPos[entry.pos] != nil,
-                appended: appendByPos[entry.pos] != nil,
+                libraryAdded: addByPos[entry.pos]?.ok == true,
+                appended: appendByPos[entry.pos]?.ok == true,
                 verified: report.finalReadback.map { readback in
                     readback.actualCatalogIds.indices.contains(entry.pos - 1)
                         && readback.actualCatalogIds[entry.pos - 1] == entry.catalogId
                         && readback.verified
                 },
-                problem: Self.positionProblem(
-                    stoppedError(in: report), pos: entry.pos, catalogId: entry.catalogId))
+                problem: {
+                    if let add = addByPos[entry.pos], !add.ok {
+                        return "Add to Library failed (HTTP \(add.httpStatus))."
+                    }
+                    if let append = appendByPos[entry.pos], !append.ok {
+                        return "Playlist append failed (HTTP \(append.httpStatus))."
+                    }
+                    return Self.positionProblem(stoppedError(in: report),
+                                                pos: entry.pos, catalogId: entry.catalogId)
+                }())
         }
     }
 

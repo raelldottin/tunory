@@ -16,7 +16,11 @@ final class Phase6ScenarioTests: XCTestCase {
             maxPlaylistPages: 20,
             propagateDelayMilliseconds: 0,
             verificationRetries: 3,
-            verificationBackoffMilliseconds: 0)))
+            verificationBackoffMilliseconds: 0,
+            appendVerificationRetries: 3,
+            appendVerificationBackoffMilliseconds: 0,
+            createRediscoveryRetries: 3,
+            createRediscoveryBackoffMilliseconds: 0)))
     }
 
     private func transportFor(ids: [Int], playlistName: String,

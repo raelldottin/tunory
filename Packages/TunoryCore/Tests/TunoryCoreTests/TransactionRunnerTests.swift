@@ -13,7 +13,11 @@ final class TransactionRunnerTests: XCTestCase {
             maxPlaylistPages: 20,
             propagateDelayMilliseconds: 0,
             verificationRetries: 3,
-            verificationBackoffMilliseconds: 0)))
+            verificationBackoffMilliseconds: 0,
+            appendVerificationRetries: 3,
+            appendVerificationBackoffMilliseconds: 0,
+            createRediscoveryRetries: 3,
+            createRediscoveryBackoffMilliseconds: 0)))
     }
 
     private func transportFor(ids: [Int], playlistName: String,
@@ -219,6 +223,56 @@ final class TransactionRunnerTests: XCTestCase {
         }
         XCTAssertEqual(status, 403)
         XCTAssertEqual(t.calls.filter { $0.name == "libraryAdd" }.count, 0)
+        XCTAssertEqual(t.calls.filter { $0.name == "append" }.count, 0)
+    }
+
+    /// Run-69 regression: after a proven 201 create, iCloud may not show the
+    /// new playlist in the library listing for several reads. The runner's
+    /// re-discovery retries ONLY not-found within its bounded budget and
+    /// then completes the transaction on proof.
+    func testCreatePolicyRediscoverySucceedsWhenCreateLags() async {
+        let ids = [101, 102]
+        let t = transportFor(ids: ids, playlistName: "P", libraryHas: [101])
+        t.playlistPages = []   // name proven uniquely absent
+        t.addsBecomeVisibleInLibrary = true
+        t.createVisibilityLag = 2   // hidden from the next 2 playlist reads
+        let manifest = Fixtures.manifest(ids: ids)
+
+        var reports: [String] = []
+        let report = await makeRunner(t).run(manifest: manifest, playlistName: "P",
+                                            missingPlaylistPolicy: .create) { phase in
+            reports.append(phase.report)
+        }
+
+        XCTAssertEqual(t.calls.filter { $0.name == "createPlaylist" }.count, 1,
+                       "creation must happen exactly once")
+        XCTAssertTrue(report.succeeded)
+        XCTAssertEqual(t.storedTracks(playlistId: t.createdPlaylistId).map(\.catalogId),
+                       [101, 102])
+        XCTAssertTrue(reports.contains { $0.contains("not yet visible (attempt 1/3)") },
+                      "each wait must be emitted as evidence: \(reports)")
+    }
+
+    /// Adversarial (run-69 class): when the create lag exceeds the
+    /// rediscovery budget, the transaction still STOPs with
+    /// playlistNotFound — success is never fabricated from the 201.
+    func testCreatePolicyStopsWhenCreateLagExceedsRediscoveryBudget() async {
+        let ids = [101]
+        let t = transportFor(ids: ids, playlistName: "P", libraryHas: ids)
+        t.playlistPages = []
+        t.createVisibilityLag = 99   // hidden far beyond the test budget
+        let manifest = Fixtures.manifest(ids: ids)
+
+        let report = await makeRunner(t).run(manifest: manifest, playlistName: "P",
+                                            missingPlaylistPolicy: .create)
+
+        XCTAssertFalse(report.succeeded)
+        guard case .playlistNotFound(let name)? = report.phases.last?.error else {
+            return XCTFail("expected playlistNotFound, got \(report.phases)")
+        }
+        XCTAssertEqual(name, "P")
+        XCTAssertEqual(t.calls.filter { $0.name == "libraryAdd" }.count, 0,
+                       "no write may follow an unproven create")
         XCTAssertEqual(t.calls.filter { $0.name == "append" }.count, 0)
     }
 
