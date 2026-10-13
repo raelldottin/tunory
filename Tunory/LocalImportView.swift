@@ -162,7 +162,7 @@ struct LocalImportView: View {
             GroupBox("Results") {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Converted: \(summary.converted)")
-                    Text("Already converted (skipped): \(summary.skipped)")
+                    Text("Already converted (skipped): \(summary.skippedValid)")
                     Text("Passed through (no conversion needed): \(summary.passthrough)")
                     Text("Conflicts: \(summary.conflict)")
                     Text("Failed: \(summary.failed)")

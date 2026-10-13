@@ -462,6 +462,20 @@ enum CLI {
         case "run":
             return await runAutomation(args: args)
 
+        case "local-import":
+            // Headless local-file import, driven by the SAME canonical
+            // LocalImportEngine the GUI uses (one implementation, two
+            // front-ends). Plans from actual content — never filenames —
+            // and never touches the Apple Music library: converted copies
+            // land in the requested output directory; adding them to
+            // Music.app stays a manual operator action.
+            //   local-import <output-dir> [--profile aac256|alac]
+            //                [--duplicates keep|skip] <file-or-dir>...
+            // Exit 0 only when every processed entry ends converted,
+            // skipped-valid, or passthrough; conflicts/undecodables
+            // exit 3 without writing those files.
+            return await runLocalImport(args: args)
+
         default:
             return 2
         }
@@ -542,6 +556,157 @@ enum CLI {
         if fileWriteFailed { return 4 }
         if !result.succeeded { return 3 }
         return 0
+    }
+
+    // MARK: - Local import verb (`local-import`)
+    //
+    // Thin adapter ONLY: every decision — passthrough, conversion profile,
+    // destination guarding, duplicate classification, validation — is
+    // derived by the canonical LocalImportEngine shared with the GUI. This
+    // verb parses arguments, prints the engine's plan/outcomes, and derives
+    // the exit code. It never re-implements a financial/media decision and
+    // never touches the Apple Music library.
+    private static func runLocalImport(args: [String]) async -> Int32 {
+        // args[0] verb; args[1] output dir; then flags and at least one input.
+        guard args.count >= 3 else {
+            fputs("local-import <output-dir> [--profile aac256|alac] [--duplicates keep|skip] <file-or-dir>...\n", stderr)
+            return 2
+        }
+        let outputDirectory = URL(fileURLWithPath: args[1])
+        var profile = ConversionProfile.aac256
+        var skipDuplicates = true
+
+        var inputs: [URL] = []
+        var index = 2
+        while index < args.count {
+            let arg = args[index]
+            if arg == "--profile", index + 1 < args.count {
+                guard let parsed = ConversionProfile(rawValue: args[index + 1]) else {
+                    fputs("error: unknown profile '\(args[index + 1])' (aac256|alac)\n", stderr)
+                    return 2
+                }
+                profile = parsed
+                index += 2
+            } else if arg == "--duplicates", index + 1 < args.count {
+                switch args[index + 1] {
+                case "skip": skipDuplicates = true
+                case "keep": skipDuplicates = false
+                default:
+                    fputs("error: --duplicates expects keep|skip\n", stderr)
+                    return 2
+                }
+                index += 2
+            } else if arg.hasPrefix("--") {
+                fputs("error: unknown flag '\(arg)'\n", stderr)
+                return 2
+            } else {
+                inputs.append(URL(fileURLWithPath: arg))
+                index += 1
+            }
+        }
+        guard !inputs.isEmpty else {
+            fputs("error: no input files or directories\n", stderr)
+            return 2
+        }
+        guard FileManager.default.fileExists(atPath: outputDirectory.path) else {
+            fputs("error: output directory does not exist: \(outputDirectory.path)\n", stderr)
+            return 2
+        }
+
+        let engine = LocalImportEngine()
+
+        // Partition into explicit files vs directories; each kind goes
+        // through its own canonical planning surface.
+        var fileInputs: [URL] = []
+        var directoryInputs: [URL] = []
+        for input in inputs {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: input.path, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                directoryInputs.append(input)
+            } else {
+                fileInputs.append(input)
+            }
+        }
+
+        let journal = LocalImportJournal(directory: outputDirectory)
+        let journalRecords = (try? journal.load())?.records ?? []
+
+        var plans: [LocalImportPlan] = []
+        if !fileInputs.isEmpty {
+            plans.append(await engine.planFiles(files: fileInputs,
+                                                 outputDirectory: outputDirectory,
+                                                 profile: profile,
+                                                 journalRecords: journalRecords))
+        }
+        for directory in directoryInputs {
+            plans.append(await engine.planBatch(sourceRoot: directory,
+                                                outputRoot: outputDirectory,
+                                                profile: profile,
+                                                journalRecords: journalRecords))
+        }
+
+        // Resolve dependencies between plans: the same file may appear via
+        // an explicit path AND inside a selected directory; a destination
+        // written by one plan changes the decision for the duplicate in a
+        // later plan. Process sequentially: canonical planning re-derives
+        // decisions from live state, so the engine itself stays the single
+        // decision authority (verified after conversion too).
+        func printPlanJSON(_ plan: LocalImportPlan) {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            guard let data = try? encoder.encode(plan),
+                  let text = String(data: data, encoding: .utf8) else {
+                fputs("error: could not encode plan\n", stderr)
+                return
+            }
+            print(text)
+        }
+        func printOutcomeJSON(_ outcome: ConversionOutcome) {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            guard let data = try? encoder.encode(outcome),
+                  let text = String(data: data, encoding: .utf8) else {
+                fputs("error: could not encode outcome\n", stderr)
+                return
+            }
+            print(text)
+        }
+
+        var exitCode: Int32 = 0
+        for plan in plans {
+            printPlanJSON(plan)
+            for entry in plan.entries {
+                if skipDuplicates, entry.duplicateOfIndex != nil {
+                    // SHA-256-identical to an earlier entry in the SAME
+                    // plan: keep the first copy, skip subsequent byte
+                    // duplicates (engine already classified them via
+                    // duplicateOfIndex; nothing is imported to a library
+                    // here, so skipping only avoids redundant conversion).
+                    continue
+                }
+                let outcome = await engine.convert(entry: entry,
+                                                  profile: profile,
+                                                  journal: journal)
+                printOutcomeJSON(outcome)
+                switch outcome.status {
+                case .converted, .skippedValid, .passthrough:
+                    break
+                case .conflict, .failed:
+                    exitCode = 3
+                }
+            }
+        }
+        if !engine.ffmpegPresent, exitCode == 0, !plans.isEmpty {
+            // Nothing failed AND ffmpeg is unusable in this environment
+            // (absent, or — observed live — unreadable under the App
+            // Sandbox, e.g. /opt/homebrew). The plan above is still
+            // valid analysis; the caller must know conversion could
+            // not run, so a bare 0 would overstate success.
+            fputs("warning: ffmpeg unusable at \(engine.ffmpegURL.path); entries that required conversion were not converted\n", stderr)
+            exitCode = 4
+        }
+        return exitCode
     }
 
     private static func ensureAuthorized() async -> Bool {

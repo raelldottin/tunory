@@ -48,7 +48,14 @@ final class LocalImportEngineTests: XCTestCase {
         if metadata {
             args += ["-metadata", "title=Test Tone", "-metadata", "artist=Tunory Tests"]
         }
-        args += ["-c:a", "flac", out.path]
+        // Force the FLAC container explicitly. Without -f, ffmpeg selects its
+        // output muxer from the file extension; a fixture deliberately named
+        // *.mp3 (the mislabeled-extension test) then picks the MP3 muxer and
+        // fails with "Exactly one MP3 audio stream is required" (captured,
+        // ffmpeg 6.x), leaving a 0-byte file. The point of the fixture is a
+        // FLAC payload in a mislabeled container, so the format must be
+        // forced, not inferred.
+        args += ["-f", "flac", "-c:a", "flac", out.path]
         try runProcess(ffmpeg, args)
         return out
     }
@@ -205,7 +212,11 @@ final class LocalImportEngineTests: XCTestCase {
     func probeMetadata(_ ffprobe: URL, _ file: URL) throws -> String {
         let p = Process()
         p.executableURL = ffprobe
-        p.arguments = ["-nostdin", "-hide_banner", "-loglevel", "error",
+        // ffprobe (unlike ffmpeg) has no -nostdin/-hide_banner options and
+        // exits with "Option not found" when given them (captured, ffmpeg
+        // 6.x) — the helper then saw empty output and reported metadata as
+        // lost. -v error is the correct quiet flag for ffprobe.
+        p.arguments = ["-v", "error",
                        "-show_entries", "format_tags=title,artist",
                        "-of", "default=noprint_wrappers=1", file.path]
         let pipe = Pipe()
@@ -242,7 +253,7 @@ final class LocalImportEngineTests: XCTestCase {
     func bitrateOf(_ ffprobe: URL, _ file: URL) throws -> Int {
         let p = Process()
         p.executableURL = ffprobe
-        p.arguments = ["-nostdin", "-hide_banner", "-loglevel", "error",
+        p.arguments = ["-v", "error",
                        "-show_entries", "format=bit_rate", "-of", "default=noprint_wrappers=1:nokey=1",
                        file.path]
         let pipe = Pipe()

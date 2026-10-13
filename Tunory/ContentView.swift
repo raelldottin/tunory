@@ -32,6 +32,7 @@ struct ContentView: View {
                 authorizationStatus: { validation.authorization }, makeEngine: validation.makeEngine))
             _recoveryModel = StateObject(wrappedValue: RecoveryViewModel(store: validation.store,
                 authorizationStatus: { validation.authorization }, makeEngine: validation.makeEngine))
+            _localImportModel = StateObject(wrappedValue: LocalImportViewModel())
             if validation.opensRecovery { _selectedTab = State(initialValue: .recovery) }
             return
         }
