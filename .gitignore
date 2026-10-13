@@ -4,6 +4,7 @@
 # SwiftPM / xcodebuild build output
 Tools/AppleMusicAPI/.build
 Packages/TunoryCore/.build
+.build
 
 # Xcode IDE state
 xcuserdata/
