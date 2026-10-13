@@ -225,6 +225,88 @@ public struct LocalImportEngine: Sendable {
 
     // MARK: - Batch planning (recursive, deterministic order)
 
+    /// Decide what to do with one already-probed file, given the batch
+    /// context. Pure decision logic shared by every planning entry point
+    /// (directory batches and GUI/CLI file lists): the single place a
+    /// conversion decision is derived.
+    static func decision(for probe: AudioProbe,
+                         sourceHash: String?,
+                         profile: ConversionProfile,
+                         destinationExists: Bool,
+                         destinationIsOurs: Bool,
+                         destinationIsValid: Bool) -> ConversionDecision {
+        guard probe.codec != nil, probe.failureDetail == nil else {
+            return .undecodableSource
+        }
+        if profile == .alac, probe.lossless != .yes {
+            return .blockedByProfile
+        }
+        if profile == .aac256, probe.lossless == .no {
+            return .passthroughNative
+        }
+        if destinationExists {
+            if destinationIsValid { return .skipValidOutput }
+            return destinationIsOurs ? .convert : .conflictDestinationInvalidForeign
+        }
+        return .convert
+    }
+
+    /// Plan an explicit list of files (GUI multi-select / CLI argument
+    /// list). Same decision logic as `planBatch` — this is the canonical
+    /// planning surface for user-selected files; presentations must call
+    /// this, never re-derive a decision.
+    public func planFiles(files: [URL],
+                          outputDirectory: URL,
+                          profile: ConversionProfile,
+                          journalRecords: [LocalImportJournalRecord]) async -> LocalImportPlan {
+        let sorted = files.sorted { $0.standardizedFileURL.path < $1.standardizedFileURL.path }
+        var entries: [LocalImportPlanEntry] = []
+        entries.reserveCapacity(sorted.count)
+        var hashToFirstIndex: [String: Int] = [:]
+        for (index, file) in sorted.enumerated() {
+            let probe = await prober.probe(url: file)
+            let destination = outputDirectory
+                .appendingPathComponent(file.deletingPathExtension().lastPathComponent)
+                .appendingPathExtension("m4a")
+            let sourceHash = Self.sha256Hex(fileURL: file)
+            let duplicateOf: Int? = {
+                guard let sourceHash else { return nil }
+                if let first = hashToFirstIndex[sourceHash] { return first }
+                hashToFirstIndex[sourceHash] = index
+                return nil
+            }()
+
+            var destinationExists = false
+            var destinationIsOurs = false
+            var destinationIsValid = false
+            if FileManager.default.fileExists(atPath: destination.path) {
+                destinationExists = true
+                destinationIsOurs = journalRecords.contains { $0.destinationPath == destination.path }
+                let destProbe = await prober.probe(url: destination)
+                destinationIsValid = destProbe.codec != nil
+                    && destProbe.failureDetail == nil
+                    && Self.matchesProfile(destProbe, profile: profile)
+            }
+            let decision = Self.decision(for: probe,
+                                         sourceHash: sourceHash,
+                                         profile: profile,
+                                         destinationExists: destinationExists,
+                                         destinationIsOurs: destinationIsOurs,
+                                         destinationIsValid: destinationIsValid)
+            entries.append(LocalImportPlanEntry(sourcePath: file.standardizedFileURL.path,
+                                                relativePath: file.lastPathComponent,
+                                                destinationPath: destination.path,
+                                                sourceSHA256: sourceHash,
+                                                probe: probe,
+                                                decision: decision,
+                                                duplicateOfIndex: duplicateOf))
+        }
+        return LocalImportPlan(sourceRoot: "(selected files)",
+                                outputRoot: outputDirectory.standardizedFileURL.path,
+                                profile: profile,
+                                entries: entries)
+    }
+
     /// Walk `sourceRoot` recursively (sorted for determinism), probe every
     /// audio file, classify duplicates within the batch by exact source
     /// SHA-256 (audio fingerprinting unavailable — chromaprint not in the
@@ -259,24 +341,23 @@ public struct LocalImportEngine: Sendable {
                 return nil
             }()
 
-            let decision: ConversionDecision
-            if probe.codec == nil || probe.failureDetail != nil {
-                decision = .undecodableSource
-            } else if profile == .alac, probe.lossless != .yes {
-                decision = .blockedByProfile
-            } else if profile == .aac256, probe.lossless == .no {
-                decision = .passthroughNative
-            } else if FileManager.default.fileExists(atPath: destination.path) {
-                let ours = journalRecords.contains { $0.destinationPath == destination.path }
+            var destinationExists = false
+            var destinationIsOurs = false
+            var destinationIsValid = false
+            if FileManager.default.fileExists(atPath: destination.path) {
+                destinationExists = true
+                destinationIsOurs = journalRecords.contains { $0.destinationPath == destination.path }
                 let destProbe = await prober.probe(url: destination)
-                let destValid = destProbe.codec != nil
+                destinationIsValid = destProbe.codec != nil
                     && destProbe.failureDetail == nil
                     && Self.matchesProfile(destProbe, profile: profile)
-                decision = destValid ? .skipValidOutput
-                    : (ours ? .convert : .conflictDestinationInvalidForeign)
-            } else {
-                decision = .convert
             }
+            let decision = Self.decision(for: probe,
+                                         sourceHash: sourceHash,
+                                         profile: profile,
+                                         destinationExists: destinationExists,
+                                         destinationIsOurs: destinationIsOurs,
+                                         destinationIsValid: destinationIsValid)
 
             entries.append(LocalImportPlanEntry(sourcePath: file.standardizedFileURL.path,
                                                 relativePath: relPath,
@@ -450,20 +531,35 @@ public struct LocalImportEngine: Sendable {
         arguments += ["-c:v", "copy", "-disposition:v", "attached_pic", output.path]
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = Pipe()
-        try process.run()
-        // ffmpeg is CPU-bound and synchronous; run it off the caller's
-        // actor via the global executor, keeping this function async
-        // without blocking a main actor.
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global().async {
-                process.waitUntilExit()
-                continuation.resume()
+        // stderr is drained CONCURRENTLY with the conversion: ffmpeg
+        // diagnostics can exceed the 64 KB pipe buffer, and an undrained
+        // pipe deadlocks the child (it blocks writing) while the parent
+        // waits for exit. EOF on this pipe implies the child is gone.
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+
+        // Race-free wait: terminationHandler fires exactly once even if
+        // the process exits before the handler is installed. Run 81
+        // captured the previous waitUntilExit-based wait never returning
+        // 25+ minutes after the ffmpeg child was already dead and
+        // reaped (caller parked in CFRunLoopRun waiting for an exit
+        // notification that never arrived) — waitUntilExit on a
+        // dispatch-global thread is not reliable for this.
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            process.terminationHandler = { _ in cont.resume() }
+            do {
+                try process.run()
+            } catch {
+                cont.resume(throwing: error)
             }
         }
+        // Child has exited (handler fired): drain to EOF is immediate.
+        let stderrData = await Task.detached {
+            stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        }.value
+
         guard process.terminationStatus == 0 else {
-            let stderrData = (process.standardError as? Pipe)?.fileHandleForReading.readDataToEndOfFile()
-            let message = String(data: stderrData ?? Data(), encoding: .utf8)?
+            let message = String(data: stderrData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown ffmpeg error"
             throw NSError(domain: "TunoryCore.ffmpeg", code: Int(process.terminationStatus),
                           userInfo: [NSLocalizedDescriptionKey: message])

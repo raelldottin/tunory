@@ -113,7 +113,7 @@ enum CLI {
 
     static let supportedVerbs = ["status", "authorize", "catalog", "preflight",
                                  "plan", "append", "verify", "transact", "recover",
-                                 "run"]
+                                 "run", "local-import"]
 
     /// Optional out-of-band argument `--checkpoint <path>` (extracted from
     /// args in `run`): where `transact` persists its interrupted-execute

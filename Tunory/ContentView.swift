@@ -6,11 +6,12 @@ struct ContentView: View {
     @StateObject private var importModel: ImportViewModel
     @StateObject private var transactionModel: TransactionViewModel
     @StateObject private var recoveryModel: RecoveryViewModel
+    @StateObject private var localImportModel: LocalImportViewModel
     #if DEBUG
     private let validationContext: UIValidationContext?
     #endif
     @Environment(\.scenePhase) private var scenePhase
-    enum Destination: Hashable { case status, importReview, recovery }
+    enum Destination: Hashable { case status, importReview, recovery, localImport }
     enum FlowStep: Hashable { case review, configure, run, results }
     @State private var selectedTab: Destination = .status
     @State private var flowStep: FlowStep = .review
@@ -40,6 +41,7 @@ struct ContentView: View {
         _importModel = StateObject(wrappedValue: ImportViewModel(authModel: auth))
         _transactionModel = StateObject(wrappedValue: TransactionViewModel())
         _recoveryModel = StateObject(wrappedValue: RecoveryViewModel())
+        _localImportModel = StateObject(wrappedValue: LocalImportViewModel())
     }
 
     var body: some View {
@@ -61,6 +63,12 @@ struct ContentView: View {
                                      onResume: resumeRecovery,
                                      onOpenStatus: { selectedTab = .status })
                             .navigationTitle("Recovery")
+                    }
+                }
+                Tab("Local Files", systemImage: "opticaldisc", value: Destination.localImport) {
+                    NavigationStack {
+                        LocalImportView(model: localImportModel)
+                            .navigationTitle("Local Files")
                     }
                 }
             }
