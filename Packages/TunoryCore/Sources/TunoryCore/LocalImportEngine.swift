@@ -656,6 +656,10 @@ public struct LocalImportEngine: Sendable {
     public static func sha256Hex(fileURL: URL) -> String? {
         guard let stream = InputStream(url: fileURL) else { return nil }
         stream.open()
+        if stream.streamStatus == .error || stream.streamError != nil {
+            // Open failed (e.g. sandbox read denial): no digest.
+            return nil
+        }
         defer { stream.close() }
         var hasher = SHA256()
         let bufferSize = 1024 * 1024
@@ -663,9 +667,19 @@ public struct LocalImportEngine: Sendable {
         defer { buffer.deallocate() }
         while stream.hasBytesAvailable {
             let read = stream.read(buffer, maxLength: bufferSize)
-            if read <= 0 { break }
+            if read < 0 {
+                // Read error: returning the empty-prefix digest here would
+                // (a) classify unreadable files as byte-duplicates of each
+                // other and (b) journal a bogus source hash. No digest is
+                // better than a wrong digest (observed live, e2e 2026-10-14:
+                // a FLAC and an MP3, both read-denied, hashed identically
+                // to e3b0c442… and the MP3 was marked a duplicate).
+                return nil
+            }
+            if read == 0 { break }
             hasher.update(data: Data(bytes: buffer, count: read))
         }
+        if stream.streamError != nil { return nil }
         let digest = hasher.finalize()
         return digest.map { String(format: "%02x", $0) }.joined()
     }

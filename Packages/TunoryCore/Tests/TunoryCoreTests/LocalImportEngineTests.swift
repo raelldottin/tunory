@@ -178,6 +178,41 @@ final class LocalImportEngineTests: XCTestCase {
         XCTAssertNil(dupA?.duplicateOfIndex)
     }
 
+    /// Regression (observed live, 2026-10-14 e2e): a read-denied file must
+    /// NOT hash to the empty-data digest. Before the fix, two distinct
+    /// unreadable files (a FLAC and an MP3, both sandbox read-denied)
+    /// hashed identically to e3b0c442… (SHA-256 of empty input) and the
+    /// second was wrongly classified as a byte-duplicate of the first.
+    func testUnreadableFileHasNoSHA256AndIsNotDuplicate() async throws {
+        // A "file" the stream layer cannot read bytes from: a directory
+        // at an audio-extension path.
+        let dir = work.appendingPathComponent("not-a-file.flac")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dir2 = work.appendingPathComponent("also-not-a-file.mp3")
+        try FileManager.default.createDirectory(at: dir2, withIntermediateDirectories: true)
+
+        XCTAssertNil(LocalImportEngine.sha256Hex(fileURL: dir),
+                      "unreadable input must yield nil, never the empty-data digest e3b0c442…")
+        XCTAssertNil(LocalImportEngine.sha256Hex(fileURL: dir2))
+
+        // Two different unreadable inputs must not be classified as
+        // byte-duplicates of each other. (planFiles, not planBatch: the
+        // batch walk pre-filters non-regular files, but the CLI's
+        // explicit-file path does not — that's where the live defect
+        // occurred.)
+        let engine = LocalImportEngine()
+        let plan = await engine.planFiles(files: [dir, dir2],
+                                          outputDirectory: work.appendingPathComponent("out"),
+                                          profile: .aac256,
+                                          journalRecords: [])
+        guard plan.entries.count == 2 else { return XCTFail("expected 2 entries, got \(plan.entries.count)") }
+        XCTAssertNil(plan.entries[0].duplicateOfIndex)
+        XCTAssertNil(plan.entries[1].duplicateOfIndex,
+                     "two read-denied files must never be byte-duplicates of each other")
+        XCTAssertNil(plan.entries[0].sourceSHA256)
+        XCTAssertNil(plan.entries[1].sourceSHA256)
+    }
+
     // MARK: - Native conversion (D1 acceptance: in-process, no external binary)
 
     func testConvertFLACToM4AReferenceProfile() async throws {
