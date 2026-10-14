@@ -3,14 +3,13 @@ import Combine
 import TunoryCore
 
 /// Local-file import workflow: select → analyze → duplicates → review →
-/// convert → results. Thin presentation adapter: every decision comes
-/// from the canonical LocalImportEngine (`planFiles`); this model only
-/// tracks flow state and the user's explicit duplicate-review choices.
-///
-/// The Music.app import step is intentionally NOT wired: the app has no
-/// Automation entitlement and live library writes need explicit operator
-/// approval (t_5ed9e8d3). The flow ends at conversion results; the user
-/// drag-imports into Music.app themselves.
+/// convert → music survey → music review → import → results.
+/// Thin presentation adapter: every decision comes from the canonical
+/// engines (`LocalImportEngine.planFiles`, `MusicImportEngine`); this
+/// model only tracks flow state and the user's explicit choices.
+/// The Music.app import step uses the Automation entitlement granted in
+/// t_559e5375; live library writes are operator-gated (t_5ed9e8d3 /
+/// t_ed3bfd46 cover signed-app + TCC proof).
 @MainActor
 final class LocalImportViewModel: ObservableObject {
 
@@ -20,6 +19,10 @@ final class LocalImportViewModel: ObservableObject {
         case review
         case converting
         case results
+        case musicSurvey
+        case musicReview
+        case musicImporting
+        case musicResults
     }
 
     /// One presented file row: engine plan entry + review decision.
@@ -67,19 +70,44 @@ final class LocalImportViewModel: ObservableObject {
     /// Index of the file being converted (progress indicator).
     @Published private(set) var convertingIndex: Int?
 
+    // MARK: - Music.app import state (all decisions from MusicImportEngine)
+
+    /// Import candidates derived from conversion outcomes: files the
+    /// convert step actually produced (converted or passthrough).
+    @Published private(set) var musicImportFiles: [URL] = []
+    /// Survey classification per import candidate, from the engine.
+    @Published private(set) var musicSurveys: [MusicLibraryCandidate] = []
+    /// Files whose survey failed outright (Music busy, script error):
+    /// fail-stop; never treated as "no candidates".
+    @Published private(set) var musicSurveyFailures: [String] = []
+    /// Per-file import outcomes, after the import run.
+    @Published private(set) var musicOutcomes: [MusicImportOutcome] = []
+    /// Warning from loading the Music import journal (unreadable etc.).
+    @Published private(set) var musicJournalWarning: String?
+    /// Index of the file being imported (progress indicator).
+    @Published private(set) var importingIndex: Int?
+
     private let engine: LocalImportEngine
+    private let musicEngine: MusicImportEngine
     private let journalDirectory: URL
+    private let musicJournalDirectory: URL
     private var selectedFiles: [URL] = []
     private var reviewDecisions: [Int: Row.ReviewDecision] = [:]
     private var generation = 0
 
     init(engine: LocalImportEngine = LocalImportEngine(),
-         journalDirectory: URL? = nil) {
+         musicEngine: MusicImportEngine? = nil,
+         journalDirectory: URL? = nil,
+         musicJournalDirectory: URL? = nil) {
         self.engine = engine
+        self.musicEngine = musicEngine
+            ?? MusicImportEngine(scripting: MusicAppScripting())
         self.journalDirectory = journalDirectory
             ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
                 .map { $0.appendingPathComponent("Tunory", isDirectory: true) }
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        self.musicJournalDirectory = musicJournalDirectory
+            ?? MusicImportJournal.defaultDirectory()
     }
 
     // MARK: - Derived review state
@@ -191,6 +219,140 @@ final class LocalImportViewModel: ObservableObject {
         return (converted, skipped, passthrough, conflict, failed)
     }
 
+    /// Import candidates for the Music step: files the convert step
+    /// actually produced. Converted files import from their destination;
+    /// passthrough files import from the original source (the engine's
+    /// convert step leaves those untouched).
+    var musicCandidatesFromOutcomes: [URL] {
+        outcomes.compactMap { outcome -> URL? in
+            switch outcome.status {
+            case .converted:
+                return outcome.destinationPath.map { URL(fileURLWithPath: $0) }
+            case .passthrough:
+                return URL(fileURLWithPath: outcome.sourcePath)
+            default:
+                return nil
+            }
+        }
+    }
+
+    // MARK: - Music import: survey (read-only, engine-decided)
+
+    /// Read-only survey of every import candidate against live Music
+    /// state. No write is issued and no journal record is written.
+    func surveyMusicLibrary() async {
+        let candidates = musicCandidatesFromOutcomes
+        guard !candidates.isEmpty else { return }
+        generation &+= 1
+        let revision = generation
+        step = .musicSurvey
+        musicImportFiles = candidates
+        musicSurveys = []
+        musicSurveyFailures = []
+        musicOutcomes = []
+        musicJournalWarning = nil
+
+        let journal = MusicImportJournal(directory: musicJournalDirectory)
+        let (_, warning) = (try? journal.load()) ?? ([], nil)
+        musicJournalWarning = warning
+
+        var surveys: [MusicLibraryCandidate] = []
+        var failures: [String] = []
+        for file in candidates {
+            guard let survey = await musicEngine.surveyFile(file: file) else {
+                failures.append(file.path)
+                continue
+            }
+            guard revision == generation else { return }
+            surveys.append(survey)
+        }
+        guard revision == generation else { return }
+        musicSurveys = surveys
+        musicSurveyFailures = failures
+        step = .musicReview
+    }
+
+    /// True when at least one surveyed file requires explicit review
+    /// (metadata collision) or the survey failed for any file: the import
+    /// cannot proceed without explicit user action.
+    var musicReviewRequired: Bool {
+        musicSurveys.contains { $0.matchKind == .needsReview }
+    }
+
+    /// Files classified as safe to import (no exact duplicate, no
+    /// metadata collision, no survey failure).
+    var musicImportReadyFiles: [URL] {
+        zip(musicImportFiles, musicSurveys).compactMap { file, survey in
+            survey.matchKind == .noCandidate ? file : nil
+        }
+    }
+
+    /// Files the user must explicitly resolve before import: metadata
+    /// collisions. Exact duplicates and survey failures never enter the
+    /// import list at all.
+    var musicFilesNeedingReview: [URL] {
+        zip(musicImportFiles, musicSurveys).compactMap { file, survey in
+            survey.matchKind == .needsReview ? file : nil
+        }
+    }
+
+    /// Import the surveyed candidates the user confirmed. The engine's
+    /// fresh in-call survey governs every file; explicit user resolution
+    /// (`reviewResolved`) is honored only for still-ambiguous surveys —
+    /// exact duplicates are never overridden.
+    func importToMusic(reviewResolved: Bool) async {
+        let files = musicImportReadyFiles + (reviewResolved ? musicFilesNeedingReview : [])
+        guard !files.isEmpty else {
+            step = .musicResults
+            return
+        }
+        generation &+= 1
+        let revision = generation
+        step = .musicImporting
+        importingIndex = nil
+
+        let journal = MusicImportJournal(directory: musicJournalDirectory)
+        let (priorRecords, _) = (try? journal.load()) ?? ([], nil)
+
+        for (index, file) in files.enumerated() {
+            importingIndex = index
+            let titleQuery = MusicImportEngine.titleQuery(forFileAt: file.path)
+            let outcome = await musicEngine.importFile(file: file,
+                                                      titleQuery: titleQuery,
+                                                      journal: journal,
+                                                      priorRecords: priorRecords,
+                                                      reviewResolved: reviewResolved)
+            guard revision == generation else { return }
+            musicOutcomes.append(outcome)
+        }
+        importingIndex = nil
+        step = .musicResults
+    }
+
+    /// Import only the confirmed files, keeping a review-free path when
+    /// nothing needs resolution.
+    func importToMusic() async {
+        if musicReviewRequired {
+            await importToMusic(reviewResolved: true)
+        } else {
+            await importToMusic(reviewResolved: false)
+        }
+    }
+
+    /// Per-file outcome rows for the results screen.
+    var musicResultsSummary: (imported: Int, skipped: Int, review: Int, failed: Int) {
+        var imported = 0, skipped = 0, review = 0, failed = 0
+        for outcome in musicOutcomes {
+            switch outcome.status {
+            case .imported: imported &+= 1
+            case .skippedDuplicate: skipped &+= 1
+            case .review: review &+= 1
+            case .failed: failed &+= 1
+            }
+        }
+        return (imported, skipped, review, failed)
+    }
+
     // MARK: - Reset
 
     func reset() {
@@ -203,6 +365,12 @@ final class LocalImportViewModel: ObservableObject {
         outputDirectory = nil
         journalWarning = nil
         convertingIndex = nil
+        musicImportFiles = []
+        musicSurveys = []
+        musicSurveyFailures = []
+        musicOutcomes = []
+        musicJournalWarning = nil
+        importingIndex = nil
         step = .select
     }
 }

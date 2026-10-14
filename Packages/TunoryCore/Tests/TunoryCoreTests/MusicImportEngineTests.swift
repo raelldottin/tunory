@@ -471,6 +471,123 @@ final class MusicImportEngineTests: XCTestCase {
         XCTAssertEqual(before, after, "import must never modify the file")
     }
 
+    // MARK: - Explicit review resolution (owner rule: never auto-resolved)
+
+    func test_importFile_metadataCollision_withoutResolution_returnsReviewWithCandidates() async throws {
+        let file = try makeFile(name: "tone.m4a", bytes: [1, 2, 3])
+        // Library holds a same-name track with DIFFERENT bytes: metadata
+        // collision, not an exact duplicate.
+        let libraryFile = try makeFile(name: "lib.m4a", bytes: [9, 9, 9])
+        let scripting = FakeMusicScripting(library: [
+            MusicTrackRef(persistentID: "CD34", name: "tone",
+                          locationPath: libraryFile.path, durationSeconds: 3.0),
+        ])
+        let engine = MusicImportEngine(scripting: scripting)
+
+        let outcome = await engine.importFile(file: file, titleQuery: "tone",
+                                              journal: makeJournal(), priorRecords: [])
+
+        XCTAssertEqual(outcome.status, .review)
+        XCTAssertEqual(scripting.addCalls.count, 0,
+                       "a review outcome must not write to Music")
+        XCTAssertEqual(outcome.reviewCandidates.count, 1)
+        XCTAssertEqual(outcome.reviewCandidates.first?.persistentID, "CD34",
+                       "review candidates are surfaced so the UI can present evidence without a second survey")
+    }
+
+    func test_importFile_reviewResolved_proceedsWithExplicitResolution() async throws {
+        let file = try makeFile(name: "tone.m4a", bytes: [1, 2, 3])
+        let libraryFile = try makeFile(name: "lib.m4a", bytes: [9, 9, 9])
+        let scripting = FakeMusicScripting(library: [
+            MusicTrackRef(persistentID: "CD34", name: "tone",
+                          locationPath: libraryFile.path, durationSeconds: 3.0),
+        ])
+        let engine = MusicImportEngine(scripting: scripting)
+        let journal = makeJournal()
+
+        let outcome = await engine.importFile(file: file, titleQuery: "tone",
+                                              journal: journal, priorRecords: [],
+                                              reviewResolved: true)
+
+        XCTAssertEqual(outcome.status, .imported)
+        XCTAssertEqual(scripting.addCalls.count, 1,
+                       "explicit user resolution is the only path past a review")
+        XCTAssertEqual(outcome.persistentID, "ADDED123")
+        let (records, _) = try journal.load()
+        XCTAssertEqual(records.last?.state, .verified)
+    }
+
+    func test_importFile_reviewResolved_exactDuplicateStillSkipped() async throws {
+        let bytes: [UInt8] = Array(0..<64).map { UInt8($0 % 251) }
+        let file = try makeFile(name: "tone.m4a", bytes: bytes)
+        let libraryFile = try makeFile(name: "lib.m4a", bytes: bytes)
+        let scripting = FakeMusicScripting(library: [
+            MusicTrackRef(persistentID: "AB12", name: "tone",
+                          locationPath: libraryFile.path, durationSeconds: 3.0),
+        ])
+        let engine = MusicImportEngine(scripting: scripting)
+
+        let outcome = await engine.importFile(file: file, titleQuery: "tone",
+                                              journal: makeJournal(), priorRecords: [],
+                                              reviewResolved: true)
+
+        XCTAssertEqual(outcome.status, .skippedDuplicate,
+                       "reviewResolved must NEVER override an exact duplicate - fresh-state classify governs")
+        XCTAssertEqual(scripting.addCalls.count, 0)
+    }
+
+    // MARK: - Canonical title query
+
+    func test_titleQuery_deterministic_basenameWithoutExtension() throws {
+        XCTAssertEqual(MusicImportEngine.titleQuery(forFileAt: "/x/y/Song Name.m4a"),
+                       "Song Name")
+        XCTAssertEqual(MusicImportEngine.titleQuery(forFileAt: "/x/y/Tone.mp3"),
+                       "Tone")
+        XCTAssertEqual(MusicImportEngine.titleQuery(forFileAt: "nosplit"),
+                       "nosplit",
+                       "a path with no extension must fall back to the full name")
+    }
+
+    // MARK: - Read-only survey
+
+    func test_surveyFile_classifiesWithoutWriting() async throws {
+        let bytes: [UInt8] = Array(0..<64).map { UInt8($0 % 251) }
+        let file = try makeFile(name: "tone.m4a", bytes: bytes)
+        let libraryFile = try makeFile(name: "lib.m4a", bytes: bytes)
+        let scripting = FakeMusicScripting(library: [
+            MusicTrackRef(persistentID: "AB12", name: "tone",
+                          locationPath: libraryFile.path, durationSeconds: 3.0),
+        ])
+        let engine = MusicImportEngine(scripting: scripting)
+
+        let survey = await engine.surveyFile(file: file)
+
+        XCTAssertEqual(survey?.matchKind, .exactDuplicate)
+        XCTAssertEqual(scripting.addCalls.count, 0,
+                       "survey is read-only - it must never issue an add")
+        XCTAssertEqual(scripting.searchQueries, ["tone"],
+                       "survey must use the canonical title query derivation")
+    }
+
+    func test_surveyFile_failedSurvey_isNilFailStop() async throws {
+        let file = try makeFile(name: "tone.m4a", bytes: [1, 2, 3])
+        let scripting = FakeMusicScripting()
+        scripting.failSearch = true
+        let engine = MusicImportEngine(scripting: scripting)
+
+        let survey = await engine.surveyFile(file: file)
+
+        XCTAssertNil(survey,
+                     "a failed survey must be nil (fail-stop), never an empty candidate list")
+    }
+
+    func test_journal_defaultDirectory_underApplicationSupport() throws {
+        let dir = MusicImportJournal.defaultDirectory()
+        XCTAssertTrue(dir.path.contains("Application Support"),
+                      "journal must live under Application Support, got \(dir.path)")
+        XCTAssertTrue(dir.path.hasSuffix("Tunory/Import"))
+    }
+
     // MARK: - Journal (durable recovery evidence)
 
     func test_journal_roundtrip_sortedAndAppendOnly() throws {

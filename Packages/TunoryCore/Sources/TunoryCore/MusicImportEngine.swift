@@ -171,6 +171,17 @@ public struct MusicImportJournal: Sendable {
         self.directory = directory
     }
 
+    /// Canonical on-disk home for the journal: Application Support /
+    /// Tunory / Import. GUI and CLI both resolve their journal through
+    /// here so recovery evidence lives in exactly one place.
+    public static func defaultDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory,
+                                            in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("Tunory", isDirectory: true)
+            .appendingPathComponent("Import", isDirectory: true)
+    }
+
     public var fileURL: URL { directory.appendingPathComponent(Self.fileName) }
 
     /// Load all records; empty when absent or unreadable. Fail-visible:
@@ -241,6 +252,24 @@ public struct MusicImportOutcome: Equatable, Sendable, Codable {
     public let decision: MusicImportDecision?
     public let persistentID: String?
     public let detail: String?
+    /// Metadata candidates behind a reviewRequired outcome (empty unless
+    /// status == .review). Lets the review UI present the evidence without
+    /// a second survey; the engine remains the only decision-maker.
+    public let reviewCandidates: [MusicTrackRef]
+
+    public init(filePath: String,
+                status: Status,
+                decision: MusicImportDecision?,
+                persistentID: String?,
+                detail: String?,
+                reviewCandidates: [MusicTrackRef] = []) {
+        self.filePath = filePath
+        self.status = status
+        self.decision = decision
+        self.persistentID = persistentID
+        self.detail = detail
+        self.reviewCandidates = reviewCandidates
+    }
 }
 
 /// The canonical Music.app import engine.
@@ -259,6 +288,18 @@ public struct MusicImportEngine: Sendable {
         await scripting.musicVersion() != nil
     }
 
+    /// Canonical title-query derivation shared by the GUI and CLI: the
+    /// import candidate's display name without its extension. Music.app's
+    /// `search` matches track names; identity is then proven (or
+    /// disproven) by the SHA-256 byte-compare in the duplicate funnel, so
+    /// a name-derived query can only widen the survey, never silently
+    /// narrow it. Deterministic: same file -> same query.
+    public static func titleQuery(forFileAt path: String) -> String {
+        let name = (path as NSString).lastPathComponent
+        let base = (name as NSString).deletingPathExtension
+        return base.isEmpty ? name : base
+    }
+
     // MARK: - Planning (pure decision logic over read-only surveys)
 
     /// Survey result for one file, using already-fetched library tracks.
@@ -274,6 +315,23 @@ public struct MusicImportEngine: Sendable {
         Self.classify(filePath: filePath,
                       candidateHash: candidateHash,
                       libraryTracks: libraryTracks)
+    }
+
+    /// End-to-end READ-ONLY survey of one import candidate against live
+    /// library state: derives the canonical title query, runs the metadata
+    /// search, and classifies. No write is issued and no journal record is
+    /// written. Returns nil when the survey itself fails (Music busy,
+    /// script error, timeout) - callers must treat nil as a fail-stop,
+    /// never as "no candidates".
+    public func surveyFile(file: URL) async -> MusicLibraryCandidate? {
+        let query = Self.titleQuery(forFileAt: file.path)
+        guard let libraryTracks = await scripting.searchLibrary(query: query) else {
+            return nil
+        }
+        let hash = LocalImportEngine.sha256Hex(fileURL: file)
+        return Self.classify(filePath: file.path,
+                             candidateHash: hash,
+                             libraryTracks: libraryTracks)
     }
 
     /// Pure classification shared by planning and reconciliation: the
@@ -339,11 +397,20 @@ public struct MusicImportEngine: Sendable {
     /// re-surveys the library read-only and only proceeds when fresh
     /// state proves the file absent - otherwise a blind retry could
     /// duplicate the very track it was uncertain about.
+    ///
+    /// Explicit review resolution: the owner rule is that metadata
+    /// collisions are never auto-resolved. When the user has explicitly
+    /// resolved a review (caller passes reviewResolved == true), the fresh
+    /// survey still runs and still governs: an exact duplicate on fresh
+    /// state is ALWAYS skipped (never overridden), but a still-ambiguous
+    /// survey proceeds on the explicit user resolution. The journal
+    /// records the resolution with the attempt.
     @discardableResult
     public func importFile(file: URL,
                            titleQuery: String,
                            journal: MusicImportJournal,
-                           priorRecords: [MusicImportJournalRecord]) async -> MusicImportOutcome {
+                           priorRecords: [MusicImportJournalRecord],
+                           reviewResolved: Bool = false) async -> MusicImportOutcome {
         let path = file.path
 
         func record(_ state: MusicImportJournalRecord.State,
@@ -404,10 +471,19 @@ public struct MusicImportEngine: Sendable {
                                       persistentID: survey.duplicate?.persistentID,
                                       detail: "byte-identical track already in library")
         case .reviewRequired:
-            return MusicImportOutcome(filePath: path, status: .review,
-                                      decision: .reviewRequired,
-                                      persistentID: nil,
-                                      detail: "metadata candidates need explicit review (not auto-resolved)")
+            // The only path past a review is an EXPLICIT user resolution
+            // (owner rule: never auto-resolved). Even then, the fresh
+            // survey above has already re-derived the decision - an
+            // exact duplicate found on fresh state is skipped above, so
+            // what proceeds here is only ever the still-ambiguous case
+            // the user saw and confirmed.
+            guard reviewResolved else {
+                return MusicImportOutcome(filePath: path, status: .review,
+                                          decision: .reviewRequired,
+                                          persistentID: nil,
+                                          detail: "metadata candidates need explicit review (not auto-resolved)",
+                                          reviewCandidates: survey.candidates)
+            }
         case .undecodableFile:
             record(.failed, hash, nil, nil)
             return MusicImportOutcome(filePath: path, status: .failed,
