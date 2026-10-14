@@ -91,6 +91,14 @@ final class LocalImportViewModel: ObservableObject {
     private let musicEngine: MusicImportEngine
     private let journalDirectory: URL
     private let musicJournalDirectory: URL
+    private let securityScopedAccess: SecurityScopedAccessClaiming
+    /// Powerbox grants held for this run: the exact URLs the user handed
+    /// us (fileImporter picks, NSOpenPanel directory). Claims must be
+    /// made on these URLs — the sandbox tracks the grant on the URL the
+    /// powerbox returned, so rebuilt copies of the path are matched back
+    /// to the originals by standardized path before claiming.
+    private var grantedFileURLs: [URL] = []
+    private var grantedOutputDirectory: URL?
     private var selectedFiles: [URL] = []
     private var reviewDecisions: [Int: Row.ReviewDecision] = [:]
     private var generation = 0
@@ -98,7 +106,8 @@ final class LocalImportViewModel: ObservableObject {
     init(engine: LocalImportEngine = LocalImportEngine(),
          musicEngine: MusicImportEngine? = nil,
          journalDirectory: URL? = nil,
-         musicJournalDirectory: URL? = nil) {
+         musicJournalDirectory: URL? = nil,
+         securityScopedAccess: SecurityScopedAccessClaiming = SystemSecurityScopedAccess()) {
         self.engine = engine
         self.musicEngine = musicEngine
             ?? MusicImportEngine(scripting: MusicAppScripting())
@@ -108,6 +117,7 @@ final class LocalImportViewModel: ObservableObject {
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
         self.musicJournalDirectory = musicJournalDirectory
             ?? MusicImportJournal.defaultDirectory()
+        self.securityScopedAccess = securityScopedAccess
     }
 
     // MARK: - Derived review state
@@ -134,6 +144,10 @@ final class LocalImportViewModel: ObservableObject {
     func select(files urls: [URL]) {
         reset()
         guard !urls.isEmpty else { return }
+        // The powerbox granted access to exactly these URLs; keep them
+        // so every later read (probe/convert/import) claims the grant
+        // on the URL the sandbox actually issued it to.
+        grantedFileURLs = urls
         selectedFiles = urls.sorted { $0.standardizedFileURL.path < $1.standardizedFileURL.path }
         selectedCount = urls.count
     }
@@ -149,9 +163,18 @@ final class LocalImportViewModel: ObservableObject {
         generation &+= 1
         let revision = generation
         self.outputDirectory = outputDirectory
+        grantedOutputDirectory = outputDirectory
         step = .analyzing
         rows = []
         reviewDecisions = [:]
+
+        // Claim every powerbox grant this read touches (selected files
+        // + destination directory, whose contents the destination guard
+        // probes), and release on every exit path.
+        let claims = SecurityScopedClaims(claiming: securityScopedAccess)
+        defer { claims.release() }
+        for url in grantedFileURLs { claims.claim(url) }
+        claims.claim(outputDirectory)
 
         let journal = LocalImportJournal(directory: journalDirectory)
         let (records, warning) = (try? journal.load()) ?? ([], nil)
@@ -191,6 +214,16 @@ final class LocalImportViewModel: ObservableObject {
         convertingIndex = nil
 
         let journal = LocalImportJournal(directory: journalDirectory)
+
+        // Claim every grant the convert writes/reads touch, once for
+        // the whole run (sources are re-read, destinations written,
+        // temp files live inside the destination directory).
+        let claims = SecurityScopedClaims(claiming: securityScopedAccess)
+        defer { claims.release() }
+        for url in grantedFileURLs { claims.claim(url) }
+        if let outputDirectory = grantedOutputDirectory ?? outputDirectory {
+            claims.claim(outputDirectory)
+        }
 
         for (index, entry) in entries.enumerated() {
             convertingIndex = index
@@ -256,6 +289,16 @@ final class LocalImportViewModel: ObservableObject {
         let (_, warning) = (try? journal.load()) ?? ([], nil)
         musicJournalWarning = warning
 
+        // Import candidates are original sources (fileImporter grants)
+        // and/or converted outputs inside the granted destination
+        // directory; the survey reads both. Claim for the whole survey.
+        let claims = SecurityScopedClaims(claiming: securityScopedAccess)
+        defer { claims.release() }
+        for url in grantedFileURLs { claims.claim(url) }
+        if let outputDirectory = grantedOutputDirectory ?? outputDirectory {
+            claims.claim(outputDirectory)
+        }
+
         var surveys: [MusicLibraryCandidate] = []
         var failures: [String] = []
         for file in candidates {
@@ -314,6 +357,16 @@ final class LocalImportViewModel: ObservableObject {
         let journal = MusicImportJournal(directory: musicJournalDirectory)
         let (priorRecords, _) = (try? journal.load()) ?? ([], nil)
 
+        // The import re-reads the candidate files (hash + Music.app's
+        // own `add` reads the file via Apple Events). Claim the grants
+        // for the whole import run.
+        let claims = SecurityScopedClaims(claiming: securityScopedAccess)
+        defer { claims.release() }
+        for url in grantedFileURLs { claims.claim(url) }
+        if let outputDirectory = grantedOutputDirectory ?? outputDirectory {
+            claims.claim(outputDirectory)
+        }
+
         for (index, file) in files.enumerated() {
             importingIndex = index
             let titleQuery = MusicImportEngine.titleQuery(forFileAt: file.path)
@@ -357,6 +410,8 @@ final class LocalImportViewModel: ObservableObject {
 
     func reset() {
         generation &+= 1
+        grantedFileURLs = []
+        grantedOutputDirectory = nil
         selectedFiles = []
         selectedCount = 0
         rows = []
