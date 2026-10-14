@@ -77,11 +77,6 @@ struct LocalImportView: View {
                         .accessibilityIdentifier("local.clearSelection")
                 }
             }
-            if !model.engineFFmpegPresent {
-                TunoryNotice(title: "ffmpeg not found",
-                             message: "Conversion requires the ffmpeg command-line tool. Files Music.app supports natively (MP3, AAC, ALAC, WAV, AIFF) are still identified and passed through, but conversion will fail until ffmpeg is installed.",
-                             symbol: "exclamationmark.triangle")
-            }
             profilePicker
         }
     }

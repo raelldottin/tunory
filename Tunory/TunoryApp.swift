@@ -697,15 +697,6 @@ enum CLI {
                 }
             }
         }
-        if !engine.ffmpegPresent, exitCode == 0, !plans.isEmpty {
-            // Nothing failed AND ffmpeg is unusable in this environment
-            // (absent, or — observed live — unreadable under the App
-            // Sandbox, e.g. /opt/homebrew). The plan above is still
-            // valid analysis; the caller must know conversion could
-            // not run, so a bare 0 would overstate success.
-            fputs("warning: ffmpeg unusable at \(engine.ffmpegURL.path); entries that required conversion were not converted\n", stderr)
-            exitCode = 4
-        }
         return exitCode
     }
 

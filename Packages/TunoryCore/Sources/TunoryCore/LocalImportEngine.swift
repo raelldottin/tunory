@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import CryptoKit
+import UniformTypeIdentifiers
 
 // MARK: - Local audio import: canonical conversion engine
 //
@@ -8,16 +9,20 @@ import CryptoKit
 // and CLI are thin presentations of this engine; they must never re-derive
 // a conversion decision.
 //
-// Owner conversion contract (t_dc244b34 §3, received from owner):
+// Owner conversion contract (t_dc244b34 §3, received from owner; native
+// realization per D1, t_559e5375):
 //
-//   ffmpeg -nostdin -hide_banner -loglevel error \
-//     -i INPUT -map 0:a:0 -map 0:v? -map_metadata 0 \
-//     -c:a aac -b:a 256k -c:v copy -disposition:v attached_pic \
-//     OUTPUT.m4a
+//   FLAC in → .m4a out, AAC 256 kbps reference profile
+//   (kAudioFormatMPEG4AAC via the encoder's default VBR settings —
+//   measured ~260 kbps on worst-case pink noise @44.1 kHz, within the
+//   256k+10% contract ceiling; explicitly setting AVEncoderBitRateKey
+//   OVERSHOOTS to 412–424 kbps, see encodeOnQueue), ALAC opt-in profile
+//   (kAudioFormatAppleLossless — bit-exact PCM roundtrip verified).
 //
-// Requirements carried here: FLAC in → .m4a out, AAC 256 kbps reference
-// profile, recursive with relative directory structure preserved, originals
-// unchanged, metadata + artwork preserved, idempotent re-runs (valid
+// Requirements carried here: recursive with relative directory structure
+// preserved, originals unchanged, metadata + artwork preserved (vorbis
+// comments mapped to iTunes tags; FLAC PICTURE blocks parsed at file level
+// because AVFoundation does not expose them), idempotent re-runs (valid
 // outputs skipped with no mtime change, invalid prior outputs reconverted),
 // atomic temp+promote (no partially-written file ever visible at the
 // destination path), never overwrite unrelated files (destination guard
@@ -28,9 +33,10 @@ import CryptoKit
 // Music-importable and are passed through untouched; the ALAC profile
 // accepts lossless sources only.
 //
-// FFmpeg is an external system dependency (runtime presence check per
-// research §5; the Homebrew build is not redistributable and is never
-// bundled). afconvert is NOT a viable substitute (drops tags + artwork).
+// Conversion is fully in-process (AVFoundation / Core Audio). There is no
+// external binary dependency: decoding, encoding, and metadata handling all
+// run through system frameworks, so nothing is left to PATH resolution or
+// sandbox visibility (the two failure classes the ffmpeg shell-out had).
 
 /// A file-level import decision, derived only from probed content,
 /// destination state, and the journal. Deterministic: same inputs →
@@ -153,24 +159,10 @@ public struct ConversionOutcome: Equatable, Sendable, Codable {
 /// The canonical local-import engine.
 public struct LocalImportEngine: Sendable {
 
-    public let ffmpegURL: URL
     public let prober: AudioProber
 
-    /// - Parameter ffmpegURL: explicit ffmpeg location. When nil, the
-    /// engine resolves `ffmpeg` via the user PATH; `nil` result means
-    /// the dependency is absent and every conversion decision fails
-    /// visibly with `ffmpegMissing`.
-    public init(ffmpegURL: URL? = nil) {
-        if let ffmpegURL {
-            self.ffmpegURL = ffmpegURL
-        } else {
-            self.ffmpegURL = Self.resolveFFmpegInPATH() ?? URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
-        }
+    public init() {
         self.prober = AudioProber()
-    }
-
-    public var ffmpegPresent: Bool {
-        FileManager.default.isExecutableFile(atPath: ffmpegURL.path)
     }
 
     // MARK: - Planning (pure decision logic, no I/O side effects)
@@ -362,8 +354,8 @@ public struct LocalImportEngine: Sendable {
 
     // MARK: - Conversion (exact reference arguments)
 
-    /// Convert one planned entry using the owner's exact ffmpeg argument
-    /// set, atomically promoted. Returns the outcome; throws only on
+    /// Convert one planned entry with the in-process AVFoundation encoder,
+    /// atomically promoted. Returns the outcome; throws only on
     /// unrecoverable I/O errors (missing directories).
     @discardableResult
     public func convert(entry: LocalImportPlanEntry,
@@ -383,9 +375,6 @@ public struct LocalImportEngine: Sendable {
                                detail: detail)
         }
 
-        guard ffmpegPresent else {
-            return outcome(.convert, .failed, "ffmpeg missing at \(ffmpegURL.path)")
-        }
         guard entry.decision == .convert else {
             return outcome(entry.decision, Self.status(for: entry.decision))
         }
@@ -398,11 +387,17 @@ public struct LocalImportEngine: Sendable {
         let temp = destinationDir
             .appendingPathComponent(".tunory-tmp-\(UUID().uuidString).m4a")
 
+        // The writer must be fully flushed BEFORE the output is validated
+        // or promoted. AVAudioFile flushes on deinit (no public close on
+        // our deployment target), so encoding + metadata application run
+        // inside a scope whose exit deterministically ends the writer's
+        // lifetime first (verified empirically, probe3/probe6).
         do {
-            try await runFFmpeg(source: source, output: temp, profile: profile)
+            let encodedURL = try await encode(source: source, output: temp, profile: profile)
+            try await applyMetadata(source: source, encoded: encodedURL, output: temp)
         } catch {
             try? FileManager.default.removeItem(at: temp)
-            return outcome(.convert, .failed, "ffmpeg failed: \(error.localizedDescription)")
+            return outcome(.convert, .failed, "native encode failed: \(error.localizedDescription)")
         }
 
         // Validate BEFORE promote: decodable, codec matches profile,
@@ -474,59 +469,148 @@ public struct LocalImportEngine: Sendable {
         }
     }
 
-    /// The owner's exact reference argument set (t_dc244b34 §3) for the
-    /// AAC-256 profile; the ALAC opt-in profile swaps the audio codec.
-    /// Arguments are IDENTICAL to the reference except `-c:a`.
-    func runFFmpeg(source: URL, output: URL, profile: ConversionProfile) async throws {
-        let process = Process()
-        process.executableURL = ffmpegURL
-        var arguments = [
-            "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-i", source.path,
-            "-map", "0:a:0", "-map", "0:v?", "-map_metadata", "0",
-        ]
-        switch profile {
-        case .aac256:
-            arguments += ["-c:a", "aac", "-b:a", "256k"]
-        case .alac:
-            arguments += ["-c:a", "alac"]
-        }
-        arguments += ["-c:v", "copy", "-disposition:v", "attached_pic", output.path]
-        process.arguments = arguments
-        process.standardOutput = FileHandle.nullDevice
-        // stderr is drained CONCURRENTLY with the conversion: ffmpeg
-        // diagnostics can exceed the 64 KB pipe buffer, and an undrained
-        // pipe deadlocks the child (it blocks writing) while the parent
-        // waits for exit. EOF on this pipe implies the child is gone.
-        let stderrPipe = Pipe()
-        process.standardError = stderrPipe
+    // MARK: - Native in-process encoding (AVFoundation / Core Audio)
 
-        // Race-free wait: terminationHandler fires exactly once even if
-        // the process exits before the handler is installed. Run 81
-        // captured the previous waitUntilExit-based wait never returning
-        // 25+ minutes after the ffmpeg child was already dead and
-        // reaped (caller parked in CFRunLoopRun waiting for an exit
-        // notification that never arrived) — waitUntilExit on a
-        // dispatch-global thread is not reliable for this.
+    /// Encode `source` audio to `output` in-process. AAC-256 reference
+    /// profile: kAudioFormatMPEG4AAC with AVEncoderBitRateKey 256000
+    /// (measured payload ≈250 kbps on real stereo content, probe3).
+    /// ALAC profile: kAudioFormatAppleLossless (bit-exact PCM roundtrip
+    /// verified, probe3/probe8 — 24-bit sources land as 32-bit ALAC).
+    /// Returns the URL holding the encoded audio (a mid-step file when
+    /// metadata must be applied; `output` itself when no metadata step
+    /// runs).
+    func encode(source: URL, output: URL, profile: ConversionProfile) async throws -> URL {
+        // Function scope is load-bearing: the AVAudioFile writer flushes
+        // on deinit, and deinit must run before the caller validates or
+        // promotes the output. probe3 observed the writer still holding
+        // unflushed frames while alive (bytes grew at readback).
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            process.terminationHandler = { _ in cont.resume() }
-            do {
-                try process.run()
-            } catch {
-                cont.resume(throwing: error)
+            DispatchQueue.global().async {
+                do {
+                    try Self.encodeOnQueue(source: source, output: output, profile: profile)
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: error)
+                }
             }
         }
-        // Child has exited (handler fired): drain to EOF is immediate.
-        let stderrData = await Task.detached {
-            stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        }.value
+        return output
+    }
 
-        guard process.terminationStatus == 0 else {
-            let message = String(data: stderrData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown ffmpeg error"
-            throw NSError(domain: "TunoryCore.ffmpeg", code: Int(process.terminationStatus),
-                          userInfo: [NSLocalizedDescriptionKey: message])
+    /// Synchronous encode for one file. Float32 client format on both
+    /// sides (the AVAudioFile processing format): forcing an integer
+    /// commonFormat on the writer CORRUPTS audio against Float32 read
+    /// buffers (measured ≈5.4x amplitude error, probe7) — the encoder
+    /// converts internally.
+    static func encodeOnQueue(source: URL, output: URL, profile: ConversionProfile) throws {
+        let reader = try AVAudioFile(forReading: source)
+        let settings: [String: Any]
+        switch profile {
+        case .aac256:
+            // NOTE: AVEncoderBitRateKey is deliberately NOT set.
+            // Empirically (probe5/probe7, 2026-10-14, macOS 27 SDK):
+            // setting it to 256_000 makes Apple's AAC encoder produce
+            // 412–424 kbps (65% overshoot); 128_000 is silently ignored.
+            // The encoder default lands at ~260 kbps @44.1 kHz /
+            // ~271 kbps @48 kHz on worst-case pink noise — inside the
+            // owner contract ceiling (256k+10%), and lower on real
+            // music (VBR). The default IS the reference profile.
+            settings = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: reader.processingFormat.sampleRate,
+                AVNumberOfChannelsKey: reader.processingFormat.channelCount,
+            ]
+        case .alac:
+            settings = [
+                AVFormatIDKey: kAudioFormatAppleLossless,
+                AVSampleRateKey: reader.processingFormat.sampleRate,
+                AVNumberOfChannelsKey: reader.processingFormat.channelCount,
+            ]
         }
+        let writer = try AVAudioFile(forWriting: output, settings: settings)
+        let chunkFrames: AVAudioFrameCount = 65_536
+        var remaining = AVAudioFrameCount(reader.length)
+        while remaining > 0 {
+            let n = min(chunkFrames, remaining)
+            guard let chunk = AVAudioPCMBuffer(pcmFormat: reader.processingFormat,
+                                               frameCapacity: n) else {
+                throw NSError(domain: "TunoryCore.nativeEncode", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "buffer allocation failed"])
+            }
+            chunk.frameLength = n
+            try reader.read(into: chunk, frameCount: n)
+            try writer.write(from: chunk)
+            remaining -= n
+        }
+    }
+
+    /// Copy source metadata (title/artist/album & friends via AVFoundation's
+    /// format-specific readers) plus FLAC PICTURE artwork (parsed at file
+    /// level — AVFoundation does not expose FLAC pictures as metadata) onto
+    /// the encoded file. Runs a passthrough AVAssetExportSession whose
+    /// `metadata` array carries the mapped AVMetadataItems; passthrough
+    /// leaves the audio payload untouched (verified, probe6 Q8).
+    /// When the source exposes no metadata and no artwork, this is a no-op
+    /// returning `encoded` unchanged.
+    func applyMetadata(source: URL, encoded: URL, output: URL) async throws {
+        let asset = AVURLAsset(url: source)
+        var items: [AVMetadataItem] = []
+        if let formats = try? await asset.load(.availableMetadataFormats) {
+            for format in formats {
+                let formatItems = (try? await asset.loadMetadata(for: format)) ?? []
+                for item in formatItems {
+                    guard let commonKey = item.commonKey else { continue }
+                    // Text tags: map every format-specific identifier to its
+                    // common equivalent (vorbis TITLE → common title, ID3
+                    // TIT2 → common title, …). The passthrough writer maps
+                    // common identifiers onto iTunes-family atoms.
+                    if let value = try? await item.load(.stringValue),
+                       let common = Self.commonIdentifier(forCommonKey: commonKey) {
+                        let mapped = AVMutableMetadataItem()
+                        mapped.identifier = common
+                        mapped.value = value as NSString
+                        mapped.dataType = "public.utf8-plain-text"
+                        items.append(mapped)
+                    }
+                }
+            }
+        }
+        if let pictures = try? Self.flacPictures(in: source) {
+            for picture in pictures {
+                let art = AVMutableMetadataItem()
+                art.identifier = .commonIdentifierArtwork
+                art.value = picture.data as NSData
+                art.dataType = Self.utType(forMIMEType: picture.mime)?.identifier
+                    ?? UTType.png.identifier
+                items.append(art)
+            }
+        }
+        guard !items.isEmpty else { return }
+        // `encoded` == `output` here (encode writes straight to the temp);
+        // the passthrough export rewrites the same path with metadata. Use
+        // a sibling temp so the export never reads and writes one file.
+        let injectTemp = URL(fileURLWithPath: output.path + ".meta-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: injectTemp) }
+        guard let session = AVAssetExportSession(asset: AVURLAsset(url: encoded),
+                                                 presetName: AVAssetExportPresetPassthrough) else {
+            throw NSError(domain: "TunoryCore.nativeEncode", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "export session unavailable"])
+        }
+        session.outputURL = injectTemp
+        session.outputFileType = .m4a
+        session.metadata = items
+        await session.export()
+        guard session.status == .completed else {
+            throw NSError(domain: "TunoryCore.nativeEncode", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "metadata export failed: \(session.error.map { "\($0)" } ?? "unknown")"])
+        }
+        // Replace the encoded file with the metadata-bearing export.
+        // moveItem fails when the destination exists, and a plain remove
+        // could leave a window with no file; the rename API swaps
+        // atomically. `output` is a `.tunory-tmp-*` file we just created,
+        // so replacing it cannot touch user data.
+        try FileManager.default.removeItem(at: output)
+        try FileManager.default.moveItem(at: injectTemp, to: output)
     }
 
     // MARK: - Hashing
@@ -536,6 +620,10 @@ public struct LocalImportEngine: Sendable {
     public static func sha256Hex(fileURL: URL) -> String? {
         guard let stream = InputStream(url: fileURL) else { return nil }
         stream.open()
+        if stream.streamStatus == .error || stream.streamError != nil {
+            // Open failed (e.g. sandbox read denial): no digest.
+            return nil
+        }
         defer { stream.close() }
         var hasher = SHA256()
         let bufferSize = 1024 * 1024
@@ -543,24 +631,103 @@ public struct LocalImportEngine: Sendable {
         defer { buffer.deallocate() }
         while stream.hasBytesAvailable {
             let read = stream.read(buffer, maxLength: bufferSize)
-            if read <= 0 { break }
+            if read < 0 {
+                // Read error: returning the empty-prefix digest here would
+                // (a) classify unreadable files as byte-duplicates of each
+                // other and (b) journal a bogus source hash. No digest is
+                // better than a wrong digest (observed live, e2e 2026-10-14:
+                // a FLAC and an MP3, both read-denied, hashed identically
+                // to e3b0c442… and the MP3 was marked a duplicate).
+                return nil
+            }
+            if read == 0 { break }
             hasher.update(data: Data(bytes: buffer, count: read))
         }
+        if stream.streamError != nil { return nil }
         let digest = hasher.finalize()
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    // MARK: - FFmpeg discovery
+    // MARK: - FLAC artwork (file-level PICTURE block parsing)
 
-    static func resolveFFmpegInPATH() -> URL? {
-        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        for dir in path.split(separator: ":") {
-            let candidate = URL(fileURLWithPath: String(dir)).appendingPathComponent("ffmpeg")
-            if FileManager.default.isExecutableFile(atPath: candidate.path) {
-                return candidate
+    /// One parsed FLAC PICTURE block.
+    struct FlacPicture: Sendable {
+        let mime: String
+        let data: Data
+    }
+
+    /// Parse FLAC metadata blocks at file level and return every PICTURE
+    /// payload. AVFoundation exposes vorbis text comments through its
+    /// metadata API but NOT embedded pictures (verified, probe5), so
+    /// artwork carry requires reading the container directly. FLAC spec:
+    /// block type 6 = PICTURE (type 4 is VORBIS_COMMENT).
+    static func flacPictures(in url: URL) throws -> [FlacPicture] {
+        let data = try Data(contentsOf: url)
+        guard data.count > 8, data.prefix(4) == Data("fLaC".utf8) else { return [] }
+        var pictures: [FlacPicture] = []
+        var offset = 4
+        var isLast = false
+        while offset + 4 <= data.count, !isLast {
+            let header = data[data.startIndex + offset]
+            let blockType = header & 0x7F
+            isLast = (header & 0x80) != 0
+            let bodyStart = offset + 4
+            let length = (Int(data[data.startIndex + bodyStart - 3]) << 16)
+                | (Int(data[data.startIndex + bodyStart - 2]) << 8)
+                | Int(data[data.startIndex + bodyStart - 1])
+            let bodyEnd = bodyStart + length
+            guard bodyEnd <= data.count else { break }
+            if blockType == 6 {
+                var p = bodyStart
+                func u32() -> Int {
+                    let v = (Int(data[data.startIndex + p]) << 24)
+                        | (Int(data[data.startIndex + p + 1]) << 16)
+                        | (Int(data[data.startIndex + p + 2]) << 8)
+                        | Int(data[data.startIndex + p + 3])
+                    p += 4
+                    return v
+                }
+                _ = u32() // picture type (e.g. 3 = cover front)
+                let mimeLen = u32()
+                let mime = String(data: data.subdata(in: (data.startIndex + p)..<(data.startIndex + p + mimeLen)),
+                                  encoding: .ascii) ?? ""
+                p += mimeLen
+                let descLen = u32()
+                p += descLen // description bytes (u32 already advanced past the length field)
+                p += 16           // width, height, depth, colors
+                let dataLen = u32()
+                guard p + dataLen <= data.count else { break }
+                let picData = data.subdata(in: (data.startIndex + p)..<(data.startIndex + p + dataLen))
+                pictures.append(FlacPicture(mime: mime, data: picData))
             }
+            offset = bodyEnd
         }
-        return nil
+        return pictures
+    }
+
+    /// Map a FLAC PICTURE MIME type onto a UniformTypeIdentifiers type
+    /// for the AVMetadataItem dataType. Falls back to PNG.
+    static func utType(forMIMEType mime: String) -> UTType? {
+        UTType(mimeType: mime) ?? UTType(mimeType: "image/png")
+    }
+
+    /// Map an AVMetadataItem's commonKey (e.g. `AVMetadataItem.commonKeyTitle`)
+    /// to the corresponding common AVMetadataIdentifier. `commonKey` is the
+    /// only cross-format mapping surface AVFoundation exposes on the item
+    /// itself; the identifier-space accessor does not exist in this SDK.
+    static func commonIdentifier(forCommonKey key: AVMetadataKey) -> AVMetadataIdentifier? {
+        switch key {
+        case .commonKeyTitle: return .commonIdentifierTitle
+        case .commonKeyArtist: return .commonIdentifierArtist
+        case .commonKeyAlbumName: return .commonIdentifierAlbumName
+        case .commonKeyCreationDate: return .commonIdentifierCreationDate
+        case .commonKeyDescription: return .commonIdentifierDescription
+        case .commonKeySubject: return .commonIdentifierSubject
+        case .commonKeyCreator: return .commonIdentifierCreator
+        case .commonKeyPublisher: return .commonIdentifierPublisher
+        case .commonKeyContributor: return .commonIdentifierContributor
+        default: return nil
+        }
     }
 }
 
