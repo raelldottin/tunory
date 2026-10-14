@@ -63,7 +63,6 @@ final class LocalImportViewModel: ObservableObject {
     @Published private(set) var outputDirectory: URL?
     @Published private(set) var profile: ConversionProfile = .aac256
     @Published private(set) var outcomes: [ConversionOutcome] = []
-    @Published private(set) var ffmpegMissing = false
     @Published private(set) var journalWarning: String?
     /// Index of the file being converted (progress indicator).
     @Published private(set) var convertingIndex: Int?
@@ -73,8 +72,6 @@ final class LocalImportViewModel: ObservableObject {
     private var selectedFiles: [URL] = []
     private var reviewDecisions: [Int: Row.ReviewDecision] = [:]
     private var generation = 0
-
-    var engineFFmpegPresent: Bool { engine.ffmpegPresent }
 
     init(engine: LocalImportEngine = LocalImportEngine(),
          journalDirectory: URL? = nil) {
@@ -140,7 +137,6 @@ final class LocalImportViewModel: ObservableObject {
         rows = plan.entries.enumerated().map { index, entry in
             Row(id: index, planEntry: entry, reviewDecision: .notReviewed)
         }
-        ffmpegMissing = !engine.ffmpegPresent
         step = .review
     }
 
@@ -206,7 +202,6 @@ final class LocalImportViewModel: ObservableObject {
         outcomes = []
         outputDirectory = nil
         journalWarning = nil
-        ffmpegMissing = false
         convertingIndex = nil
         step = .select
     }
