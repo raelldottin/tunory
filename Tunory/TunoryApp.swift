@@ -113,7 +113,7 @@ enum CLI {
 
     static let supportedVerbs = ["status", "authorize", "catalog", "preflight",
                                  "plan", "append", "verify", "transact", "recover",
-                                 "run", "local-import"]
+                                 "run", "local-import", "music-import"]
 
     /// Optional out-of-band argument `--checkpoint <path>` (extracted from
     /// args in `run`): where `transact` persists its interrupted-execute
@@ -476,6 +476,18 @@ enum CLI {
             // exit 3 without writing those files.
             return await runLocalImport(args: args)
 
+        case "music-import":
+            // Headless Music.app library import, driven by the SAME
+            // canonical MusicImportEngine the GUI uses (one
+            // implementation, two front-ends). Read-only survey first;
+            // exact duplicates are always skipped; metadata collisions
+            // are reported and require --resolve-review to import;
+            // every add is journaled before it is issued.
+            //   music-import [--resolve-review] <file>...
+            // Exit 0 only when every file ends imported or
+            // skipped-duplicate; review/failed outcomes exit 3.
+            return await runMusicImport(args: args)
+
         default:
             return 2
         }
@@ -695,6 +707,89 @@ enum CLI {
                 case .conflict, .failed:
                     exitCode = 3
                 }
+            }
+        }
+        return exitCode
+    }
+
+    // MARK: - Music import verb (`music-import`)
+    //
+    // Thin adapter ONLY: every decision — survey classification, duplicate
+    // skipping, review gating, journaling — is derived by the canonical
+    // MusicImportEngine shared with the GUI. This verb parses arguments,
+    // prints the engine's surveys/outcomes as JSON lines, and derives the
+    // exit code. It never re-implements a duplicate decision.
+    private static func runMusicImport(args: [String]) async -> Int32 {
+        // args[0] verb; then optional flags and at least one input file.
+        guard args.count >= 2 else {
+            fputs("music-import [--resolve-review] <file>...\n", stderr)
+            return 2
+        }
+
+        var resolveReview = false
+        var inputs: [URL] = []
+        var index = 1
+        while index < args.count {
+            let arg = args[index]
+            if arg == "--resolve-review" {
+                resolveReview = true
+                index += 1
+            } else if arg.hasPrefix("--") {
+                fputs("error: unknown flag '\(arg)'\n", stderr)
+                return 2
+            } else {
+                inputs.append(URL(fileURLWithPath: arg))
+                index += 1
+            }
+        }
+        guard !inputs.isEmpty else {
+            fputs("error: no input files\n", stderr)
+            return 2
+        }
+        for input in inputs where !FileManager.default.fileExists(atPath: input.path) {
+            fputs("error: input file does not exist: \(input.path)\n", stderr)
+            return 2
+        }
+
+        let engine = MusicImportEngine(scripting: MusicAppScripting())
+        let journal = MusicImportJournal(directory: MusicImportJournal.defaultDirectory())
+        let (priorRecords, journalWarning) = (try? journal.load()) ?? ([], nil)
+        if let journalWarning {
+            // Fail-visible, not fatal: the journal being unreadable must
+            // never silently enable a re-import the records would have
+            // blocked.
+            fputs("warning: \(journalWarning)\n", stderr)
+        }
+
+        func printJSONLine<T: Encodable>(_ value: T) {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            guard let data = try? encoder.encode(value),
+                  let text = String(data: data, encoding: .utf8) else {
+                fputs("error: could not encode outcome\n", stderr)
+                return
+            }
+            print(text)
+        }
+
+        var exitCode: Int32 = 0
+        for file in inputs {
+            // The engine's fresh in-call survey governs every file; the
+            // --resolve-review flag is the CLI's explicit user resolution
+            // for still-ambiguous surveys only (exact duplicates are
+            // never overridden by it).
+            let titleQuery = MusicImportEngine.titleQuery(forFileAt: file.path)
+            let outcome = await engine.importFile(file: file,
+                                                  titleQuery: titleQuery,
+                                                  journal: journal,
+                                                  priorRecords: priorRecords,
+                                                  reviewResolved: resolveReview)
+            printJSONLine(outcome)
+            switch outcome.status {
+            case .imported, .skippedDuplicate:
+                break
+            case .review, .failed:
+                exitCode = 3
             }
         }
         return exitCode

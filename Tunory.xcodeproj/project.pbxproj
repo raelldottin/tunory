@@ -392,6 +392,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Tunory;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.music";
+				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Tunory sends Apple Events to Music to import your converted local files into your Music library. Tunory never modifies your original files.";
 				INFOPLIST_KEY_NSAppleMusicUsageDescription = "Tunory uses Apple Music access to add selected songs to your library and create or update playlists.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -435,6 +436,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Tunory;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.music";
+				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Tunory sends Apple Events to Music to import your converted local files into your Music library. Tunory never modifies your original files.";
 				INFOPLIST_KEY_NSAppleMusicUsageDescription = "Tunory uses Apple Music access to add selected songs to your library and create or update playlists.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;

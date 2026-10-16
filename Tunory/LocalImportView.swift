@@ -4,19 +4,22 @@ import UniformTypeIdentifiers
 import TunoryCore
 
 /// Local-file import flow: Select → Analyze → Review (duplicates) →
-/// Convert → Results. Every decision shown is derived by the canonical
-/// LocalImportEngine; this view presents and collects explicit user
-/// confirmation (owner rule: ambiguous duplicates are never auto-resolved).
+/// Convert → Music Survey → Music Review → Import → Results. Every
+/// decision shown is derived by the canonical engines
+/// (`LocalImportEngine`, `MusicImportEngine`); this view presents and
+/// collects explicit user confirmation (owner rule: ambiguous duplicates
+/// are never auto-resolved).
 ///
-/// The Music.app import step is intentionally not wired to any live
-/// library write (no Automation entitlement; live writes need explicit
-/// operator approval — t_5ed9e8d3). Results point at the output folder
-/// for manual drag-import.
+/// The Music.app import step writes to the user's Music library via the
+/// Automation entitlement. Every import is preceded by a read-only
+/// survey, an explicit confirmation, and is journaled; live library
+/// write proof under TCC is tracked by t_ed3bfd46.
 struct LocalImportView: View {
     @ObservedObject var model: LocalImportViewModel
 
     @State private var showFileImporter = false
     @State private var showConvertConfirmation = false
+    @State private var showMusicImportConfirmation = false
 
     var body: some View {
         TunoryScreen {
@@ -26,6 +29,10 @@ struct LocalImportView: View {
             case .review:     reviewBody
             case .converting: convertingBody
             case .results:    resultsBody
+            case .musicSurvey:   musicSurveyBody
+            case .musicReview:   musicReviewBody
+            case .musicImporting: musicImportingBody
+            case .musicResults:   musicResultsBody
             }
         }
         .fileImporter(isPresented: $showFileImporter,
@@ -152,7 +159,7 @@ struct LocalImportView: View {
         Group {
             let summary = model.resultsSummary
             TunoryNotice(title: "Conversion finished",
-                         message: "Converted copies are ready. Drag them into Music.app to add them to your library — Tunory does not write to your Music library.",
+                         message: "Converted copies are ready. You can import them into your Music library directly — Tunory surveys the library first and skips exact duplicates.",
                          symbol: "checkmark.circle")
             GroupBox("Results") {
                 VStack(alignment: .leading, spacing: 8) {
@@ -179,6 +186,12 @@ struct LocalImportView: View {
             }
             outcomesBox
             TunoryActions {
+                if !model.musicCandidatesFromOutcomes.isEmpty {
+                    Button("Continue to Music Import") {
+                        Task { await model.surveyMusicLibrary() }
+                    }
+                    .accessibilityIdentifier("local.continueToMusicImport")
+                }
                 Button("Import More Files") { model.reset() }
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier("local.importMore")
@@ -213,6 +226,164 @@ struct LocalImportView: View {
         case .skippedValid: return "⏭"
         case .passthrough: return "→"
         case .conflict: return "⚠"
+        case .failed: return "✗"
+        }
+    }
+
+    // MARK: - Music import (survey → review → importing → results)
+
+    /// Survey: read-only classification of every import candidate against
+    /// live Music state. The survey results drive the review step.
+    private var musicSurveyBody: some View {
+        Group {
+            let total = model.musicImportFiles.count
+            TunoryNotice(title: "Checking Music library…",
+                         message: "Tunory is comparing each file against your Music library by content (SHA-256), read-only. Nothing is added yet.",
+                         symbol: "magnifyingglass")
+            ProgressView(value: Double((model.importingIndex ?? 0)), total: Double(max(total, 1))) {
+                Text("Surveying \((model.importingIndex ?? 0) + 1) of \(total)…")
+            }
+            .accessibilityIdentifier("local.musicSurveyProgress")
+        }
+    }
+
+    /// Review: present survey classification per file and collect explicit
+    /// confirmation. Metadata collisions are never auto-resolved.
+    private var musicReviewBody: some View {
+        Group {
+            TunoryNotice(title: "Review Music import",
+                         message: "Each file below was compared against your Music library. Duplicates are always skipped; ambiguous matches need your explicit decision.",
+                         symbol: "checkmark.rectangle")
+            if let warning = model.musicJournalWarning {
+                Text(warning)
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            if !model.musicSurveyFailures.isEmpty {
+                GroupBox("Survey failures (import blocked)") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(model.musicSurveyFailures, id: \.self) { path in
+                            Text("✗ \(path)").font(.caption)
+                        }
+                        Text("These files could not be surveyed. Importing without a survey could duplicate library tracks — they are excluded.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            GroupBox("Files ready to import") {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(model.musicImportReadyFiles, id: \.path) { file in
+                        Text("→ \((file.path as NSString).lastPathComponent)")
+                    }
+                    if model.musicImportReadyFiles.isEmpty {
+                        Text("No files are safe to import.").foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if !model.musicFilesNeedingReview.isEmpty {
+                GroupBox("Ambiguous matches — explicit decision required") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(model.musicFilesNeedingReview, id: \.path) { file in
+                            Text("⚠ \((file.path as NSString).lastPathComponent)")
+                        }
+                        Text("These files match library tracks by metadata but not by content. Importing them may create duplicates — confirm below only if you want both versions.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            TunoryActions {
+                Button("Cancel") { model.reset() }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("local.musicCancel")
+                if !model.musicImportReadyFiles.isEmpty || !model.musicFilesNeedingReview.isEmpty {
+                    Button(model.musicFilesNeedingReview.isEmpty
+                           ? "Import to Music"
+                           : "Import All (I reviewed the ambiguous matches)") {
+                        showMusicImportConfirmation = true
+                    }
+                    .accessibilityIdentifier("local.musicImportConfirm")
+                }
+            }
+        }
+        .confirmationDialog(
+            "Add \(model.musicImportReadyFiles.count + model.musicFilesNeedingReview.count) file(s) to your Music library?",
+            isPresented: $showMusicImportConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Add to Music Library", role: .destructive) {
+                Task { await model.importToMusic() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Tunory will add the files to your Music library. Exact duplicates are skipped automatically; this cannot be undone in bulk.")
+        }
+    }
+
+    private var musicImportingBody: some View {
+        Group {
+            let total = model.musicImportReadyFiles.count + model.musicFilesNeedingReview.count
+            TunoryNotice(title: "Importing to Music…",
+                         message: "Files are being added to your Music library. Each add is journaled before it is issued.",
+                         symbol: "arrow.down.circle")
+            ProgressView(value: Double((model.importingIndex ?? 0) + 1), total: Double(max(total, 1))) {
+                Text("Importing \((model.importingIndex ?? 0) + 1) of \(max(total, 1))…")
+            }
+            .accessibilityIdentifier("local.musicImportingProgress")
+        }
+    }
+
+    private var musicResultsBody: some View {
+        Group {
+            let summary = model.musicResultsSummary
+            TunoryNotice(title: "Music import finished",
+                         message: "Each file's outcome below is the engine's verified result, journaled for recovery. Uncertain imports are reported, never assumed.",
+                         symbol: "checkmark.circle")
+            GroupBox("Music import results") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Imported: \(summary.imported)")
+                    Text("Skipped (exact duplicates): \(summary.skipped)")
+                    Text("Needs review (not imported): \(summary.review)")
+                    Text("Failed: \(summary.failed)")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("local.musicResultsSummary")
+            }
+            if !model.musicOutcomes.isEmpty {
+                GroupBox("Per-file import outcomes") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(Array(model.musicOutcomes.enumerated()), id: \.offset) { _, outcome in
+                            HStack(alignment: .top) {
+                                Text(musicStatusSymbol(outcome.status))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text((outcome.filePath as NSString).lastPathComponent)
+                                    Text(outcome.detail ?? outcome.status.rawValue)
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if let warning = model.musicJournalWarning {
+                Text(warning)
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            TunoryActions {
+                Button("Import More Files") { model.reset() }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("local.importMore")
+            }
+        }
+    }
+
+    private func musicStatusSymbol(_ status: MusicImportOutcome.Status) -> String {
+        switch status {
+        case .imported: return "✓"
+        case .skippedDuplicate: return "⏭"
+        case .review: return "⚠"
         case .failed: return "✗"
         }
     }
