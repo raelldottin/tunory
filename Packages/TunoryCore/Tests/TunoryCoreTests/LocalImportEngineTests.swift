@@ -351,6 +351,179 @@ final class LocalImportEngineTests: XCTestCase {
         }
     }
 
+    // MARK: - Extended metadata carry (GAP B, phase 11)
+
+    /// Full identifier dump of a file via AVFoundation (every format,
+    /// identifier-qualified). Used by the GAP B roundtrip tests to prove
+    /// the extended fields land as the exact iTunes-family atoms.
+    static func identifierDump(of url: URL) async throws -> [String: String] {
+        let asset = AVURLAsset(url: url)
+        var result: [String: String] = [:]
+        let formats = try await asset.load(.availableMetadataFormats)
+        for format in formats {
+            let items = try await asset.loadMetadata(for: format)
+            for item in items {
+                guard let identifier = item.identifier else { continue }
+                if let value = try? await item.load(.stringValue) {
+                    result[identifier.rawValue] = value
+                }
+            }
+        }
+        return result
+    }
+
+    func testConvertFLACCarriesAlbumArtistDiscTrack() async throws {
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        // FLAC with the three GAP B fields (vorbis comments) + base tags.
+        let flac = work.appendingPathComponent("extended.flac")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                                "-c:a", "flac",
+                                "-metadata", "title=Ext Tone", "-metadata", "artist=Ext Artist",
+                                "-metadata", "album=Ext Album",
+                                "-metadata", "ALBUMARTIST=Ext Album Artist",
+                                "-metadata", "DISCNUMBER=2", "-metadata", "TRACKNUMBER=7",
+                                flac.path])
+
+        let outDir = work.appendingPathComponent("out", isDirectory: true)
+        let engine = LocalImportEngine()
+        let journal = LocalImportJournal(directory: outDir.appendingPathComponent(".tunory"))
+        let plan = await engine.planBatch(sourceRoot: work, outputRoot: outDir,
+                                            profile: .aac256, journalRecords: [])
+        let entry = plan.entries.first { $0.sourcePath.hasSuffix("extended.flac") }!
+        let outcome = await engine.convert(entry: entry, profile: .aac256, journal: journal)
+        XCTAssertEqual(outcome.status, .converted, outcome.detail ?? "")
+
+        let dest = URL(fileURLWithPath: entry.destinationPath)
+        let metadata = try await Self.commonMetadata(of: dest)
+        XCTAssertEqual(metadata["title"], "Ext Tone")
+        XCTAssertEqual(metadata["artist"], "Ext Artist")
+        XCTAssertEqual(metadata["album"], "Ext Album")
+
+        // GAP B contract: the three fields that lack common keys must land
+        // as iTunes-family atoms on the converted m4a.
+        let dump = try await Self.identifierDump(of: dest)
+        XCTAssertEqual(dump["itsk/aART"], "Ext Album Artist",
+                       "album artist must survive conversion")
+        let trkn = try await Self.positionalAtom(of: dest, identifier: "itsk/trkn")
+        XCTAssertEqual(trkn?.number, 7, "track number must survive conversion")
+        let disk = try await Self.positionalAtom(of: dest, identifier: "itsk/disk")
+        XCTAssertEqual(disk?.number, 2, "disc number must survive conversion")
+    }
+
+    func testApplyMetadataCarriesID3AlbumArtistDiscTrack() async throws {
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        // MP3 sources are passthroughNative in the convert flow (lossy →
+        // no re-encode), so the id3/* mapping is exercised through the
+        // metadata stage itself: encode the mp3 once, then apply metadata
+        // from the ID3-tagged source onto that encoded file.
+        let mp3 = work.appendingPathComponent("tagged.mp3")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=550:duration=3",
+                                "-c:a", "libmp3lame", "-b:a", "128k", "-id3v2_version", "3",
+                                "-metadata", "title=Totalling",
+                                "-metadata", "TPE2=Total Album Artist",
+                                "-metadata", "TPOS=2/2", "-metadata", "TRCK=7/12",
+                                mp3.path])
+        let engine = LocalImportEngine()
+        let outDir = work.appendingPathComponent("out3", isDirectory: true)
+        try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+        let encoded = outDir.appendingPathComponent("encoded.m4a")
+        _ = try await engine.encode(source: mp3, output: encoded, profile: .aac256)
+        try await engine.applyMetadata(source: mp3, encoded: encoded, output: encoded)
+
+        let dump = try await Self.identifierDump(of: encoded)
+        XCTAssertEqual(dump["itsk/aART"], "Total Album Artist",
+                       "ID3 TPE2 must map onto the aART atom")
+        let trkn = try await Self.positionalAtom(of: encoded, identifier: "itsk/trkn")
+        XCTAssertEqual(trkn?.number, 7)
+        XCTAssertEqual(trkn?.total, 12, "ID3 TRCK 'n/total' totals must survive")
+        let disk = try await Self.positionalAtom(of: encoded, identifier: "itsk/disk")
+        XCTAssertEqual(disk?.number, 2)
+        XCTAssertEqual(disk?.total, 2, "ID3 TPOS 'n/total' totals must survive")
+    }
+
+    func testConvertCarriesVorbisTrackAndDiscTotals() async throws {
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        // Vorbis "n/total" shapes must keep BOTH number and total.
+        let flac = work.appendingPathComponent("totalling.flac")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                                "-c:a", "flac",
+                                "-metadata", "title=Totalling F",
+                                "-metadata", "ALBUMARTIST=Total Album Artist F",
+                                "-metadata", "DISCNUMBER=2/2", "-metadata", "TRACKNUMBER=7/12",
+                                flac.path])
+        let outDir = work.appendingPathComponent("out2", isDirectory: true)
+        let engine = LocalImportEngine()
+        let journal = LocalImportJournal(directory: outDir.appendingPathComponent(".tunory"))
+        let plan = await engine.planBatch(sourceRoot: work, outputRoot: outDir,
+                                            profile: .aac256, journalRecords: [])
+        let entry = plan.entries.first { $0.sourcePath.hasSuffix("totalling.flac") }!
+        let outcome = await engine.convert(entry: entry, profile: .aac256, journal: journal)
+        XCTAssertEqual(outcome.status, .converted, outcome.detail ?? "")
+        let dest = URL(fileURLWithPath: entry.destinationPath)
+        let dump = try await Self.identifierDump(of: dest)
+        XCTAssertEqual(dump["itsk/aART"], "Total Album Artist F")
+        let trkn = try await Self.positionalAtom(of: dest, identifier: "itsk/trkn")
+        XCTAssertEqual(trkn?.number, 7)
+        XCTAssertEqual(trkn?.total, 12, "vorbis 'n/total' totals must survive")
+        let disk = try await Self.positionalAtom(of: dest, identifier: "itsk/disk")
+        XCTAssertEqual(disk?.number, 2)
+        XCTAssertEqual(disk?.total, 2)
+    }
+
+    func testExtendedMetadataParserEdgeCases() {
+        // Deterministic parser contract, hand-built inputs (no ffmpeg).
+        // "n" and "n/t" parse; whitespace trims; garbage rejects.
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag("7")?.number, 7)
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag(" 7 ")?.number, 7)
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag("7/12")?.number, 7)
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag("7/12")?.total, 12)
+        XCTAssertNil(LocalImportEngine.parsePositionalTag("seven"))
+        XCTAssertNil(LocalImportEngine.parsePositionalTag("-1"))
+        XCTAssertNil(LocalImportEngine.parsePositionalTag(""))
+        // Unparseable total: the number still parses, so the tag is kept
+        // and only the total is dropped (documented parser contract).
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag("7/twelve")?.number, 7)
+        XCTAssertNil(LocalImportEngine.parsePositionalTag("7/twelve")?.total,
+                     "unparseable total keeps number")
+        // A total that exceeds the 16-bit atom field: the tag keeps the
+        // number, the total is dropped rather than wrapped or truncated.
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag("7/70000")?.number, 7)
+        XCTAssertNil(LocalImportEngine.parsePositionalTag("7/70000")?.total)
+        XCTAssertNil(LocalImportEngine.parsePositionalTag("70000"), "number beyond 16-bit rejects the tag")
+        // Binary atom roundtrip (m4a source path).
+        let atom = LocalImportEngine.iTunesPositionalAtom(number: 7, total: 12)
+        XCTAssertEqual(atom.count, 8)
+        XCTAssertEqual([UInt8](atom), [0, 0, 0, 7, 0, 12, 0, 0])
+        XCTAssertEqual(LocalImportEngine.parsePositionalAtom(atom)?.number, 7)
+        XCTAssertEqual(LocalImportEngine.parsePositionalAtom(atom)?.total, 12)
+        // Short/garbage payloads reject, never guess.
+        XCTAssertNil(LocalImportEngine.parsePositionalAtom(Data([0, 0, 0])))
+        XCTAssertNil(LocalImportEngine.parsePositionalAtom(Data()))
+        // No-total atom: number present, total nil.
+        let noTotal = LocalImportEngine.iTunesPositionalAtom(number: 2, total: nil)
+        XCTAssertEqual(LocalImportEngine.parsePositionalAtom(noTotal)?.number, 2)
+        XCTAssertNil(LocalImportEngine.parsePositionalAtom(noTotal)?.total)
+    }
+
+    /// Read one positional iTunes atom (trkn/disk) from a file as
+    /// (number, total) via AVFoundation.
+    static func positionalAtom(of url: URL, identifier raw: String) async throws -> (number: Int, total: Int?)? {
+        let asset = AVURLAsset(url: url)
+        let formats = try await asset.load(.availableMetadataFormats)
+        for format in formats {
+            let items = try await asset.loadMetadata(for: format)
+            for item in items {
+                guard item.identifier?.rawValue == raw,
+                      let data = try? await item.load(.dataValue) else { continue }
+                return LocalImportEngine.parsePositionalAtom(data)
+            }
+        }
+        return nil
+    }
+
     // MARK: - Idempotency + adversarial destination states (§8.3)
 
     func testIdempotentSecondRunSkipsValidOutput() async throws {

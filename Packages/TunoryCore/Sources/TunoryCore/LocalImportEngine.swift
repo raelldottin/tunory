@@ -559,6 +559,14 @@ public struct LocalImportEngine: Sendable {
             for format in formats {
                 let formatItems = (try? await asset.loadMetadata(for: format)) ?? []
                 for item in formatItems {
+                    // Extended fields first: they have NO common key, so the
+                    // commonKey path below can never carry them.
+                    if let identifier = item.identifier,
+                       let field = Self.extendedSourceIdentifiers[identifier.rawValue],
+                       let mapped = await Self.extendedMetadataItem(for: field, from: item) {
+                        items.append(mapped)
+                        continue
+                    }
                     guard let commonKey = item.commonKey else { continue }
                     // Text tags: map every format-specific identifier to its
                     // common equivalent (vorbis TITLE → common title, ID3
@@ -728,6 +736,140 @@ public struct LocalImportEngine: Sendable {
         case .commonKeyContributor: return .commonIdentifierContributor
         default: return nil
         }
+    }
+
+    // MARK: - Extended metadata carry (GAP B, phase 11)
+    //
+    // Album artist, disc number and track number have NO AVMetadata common
+    // key, so the commonKey mapping above silently drops them. Empirically
+    // pinned per container (probe, 2026-10-16, macOS 27 SDK):
+    //   FLAC  → vorb/ALBUMARTIST, vorb/DISCNUMBER, vorb/TRACKNUMBER (strings)
+    //   MP3   → id3/TPE2, id3/TPOS ("n/t"), id3/TRCK ("n/t")          (strings)
+    //   m4a   → itsk/aART (string), itsk/disk, itsk/trkn (8-byte binary atoms)
+    // WAV/AIFF surface only caaf/… items (no album artist/disc/track), so
+    // those containers contribute nothing here. The destination identifiers
+    // below were verified to survive the passthrough export byte-faithfully:
+    // aART lands as a text atom; trkn/disk land as the canonical 8-byte
+    // atoms (00 00 NN NN TT TT 00 00), identical to ffmpeg's layout.
+
+    /// The three carried fields that lack a common key.
+    enum ExtendedMetadataField: String, Sendable {
+        case albumArtist, discNumber, trackNumber
+    }
+
+    /// Destination iTunes-family identifier per field (verified to survive
+    /// the passthrough export; the m4a writer maps them onto itsk atoms).
+    static let extendedDestinationIdentifier: [ExtendedMetadataField: AVMetadataIdentifier] = [
+        .albumArtist: .iTunesMetadataAlbumArtist,
+        .discNumber: .iTunesMetadataDiscNumber,
+        .trackNumber: .iTunesMetadataTrackNumber,
+    ]
+
+    /// Source identifier (identifier.rawValue, format/keySpace-qualified) →
+    /// field. Exact spellings as AVFoundation reports them — see the
+    /// probe evidence above.
+    static let extendedSourceIdentifiers: [String: ExtendedMetadataField] = [
+        "vorb/ALBUMARTIST": .albumArtist,
+        "id3/TPE2": .albumArtist,
+        "itsk/aART": .albumArtist,
+        "vorb/DISCNUMBER": .discNumber,
+        "id3/TPOS": .discNumber,
+        "itsk/disk": .discNumber,
+        "vorb/TRACKNUMBER": .trackNumber,
+        "id3/TRCK": .trackNumber,
+        "itsk/trkn": .trackNumber,
+    ]
+
+    /// Largest value a trkn/disk 16-bit atom field can hold.
+    static let positionalTagLimit = 0xFFFF
+
+    /// Deterministic positional-tag parser for the ID3/vorbis value shapes
+    /// "n" and "n/total" (TPOS/TRCK spec form; vorbis DISCNUMBER/TRACKNUMBER
+    /// use the same shapes). Whitespace is trimmed; a non-integer number, a
+    /// negative, or an out-of-16-bit-range value rejects the whole tag;
+    /// an unparseable total keeps the number and drops the total. Returns
+    /// nil when no leading integer exists — unparseable values are skipped,
+    /// never guessed onto the output.
+    static func parsePositionalTag(_ raw: String) -> (number: Int, total: Int?)? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = trimmed.split(separator: "/",
+                                 maxSplits: 1,
+                                 omittingEmptySubsequences: false)
+        guard let rawNumber = parts.first,
+              let number = Int(rawNumber),
+              (0...Self.positionalTagLimit).contains(number) else { return nil }
+        let total: Int?
+        if parts.count > 1 {
+            total = Int(parts[1]).flatMap { (0...Self.positionalTagLimit).contains($0) ? $0 : nil }
+        } else {
+            total = nil
+        }
+        return (number, total)
+    }
+
+    /// Parse the canonical iTunes binary trkn/disk atom: 16-bit big-endian
+    /// number at offset 2, total at offset 4 when at least 6 bytes are
+    /// present. A zero total means "unset" (iTunes convention — ffmpeg
+    /// writes 00 00 in the total field when none was given) and is
+    /// normalized to nil. Anything shorter or empty is nil (skip, never
+    /// guess).
+    static func parsePositionalAtom(_ data: Data) -> (number: Int, total: Int?)? {
+        guard data.count >= 4 else { return nil }
+        func be16(_ offset: Int) -> Int {
+            (Int(data[offset]) << 8) | Int(data[offset + 1])
+        }
+        let number = be16(2)
+        guard number <= Self.positionalTagLimit else { return nil }
+        var total: Int?
+        if data.count >= 6 {
+            let raw = be16(4)
+            total = raw == 0 ? nil : raw
+        }
+        if let total, total > Self.positionalTagLimit { return nil }
+        return (number, total)
+    }
+
+    /// Canonical 8-byte iTunes trkn/disk atom payload (byte-identical to
+    /// ffmpeg's `-metadata track=7/12` output — verified probe 2026-10-16):
+    /// 00 00 NN NN TT TT 00 00, big-endian.
+    static func iTunesPositionalAtom(number: Int, total: Int?) -> Data {
+        var data = Data(count: 8)
+        func put16(_ value: Int, at offset: Int) {
+            data[offset] = UInt8((value >> 8) & 0xFF)
+            data[offset + 1] = UInt8(value & 0xFF)
+        }
+        put16(number, at: 2)
+        if let total { put16(total, at: 4) }
+        return data
+    }
+
+    /// Build the destination item for one extended field from a source
+    /// item. Album artist maps as text; disc/track map as the canonical
+    /// binary atom (string source values parsed first, then binary atom
+    /// payloads). Returns nil when the source carries no usable value —
+    /// the field is then simply not written.
+    static func extendedMetadataItem(for field: ExtendedMetadataField,
+                                     from item: AVMetadataItem) async -> AVMutableMetadataItem? {
+        let mapped = AVMutableMetadataItem()
+        mapped.identifier = extendedDestinationIdentifier[field]
+        switch field {
+        case .albumArtist:
+            guard let value = try? await item.load(.stringValue),
+                  !value.isEmpty else { return nil }
+            mapped.value = value as NSString
+            mapped.dataType = "public.utf8-plain-text"
+        case .discNumber, .trackNumber:
+            var position = (try? await item.load(.stringValue))
+                .flatMap(Self.parsePositionalTag)
+            if position == nil,
+               let data = try? await item.load(.dataValue) {
+                position = Self.parsePositionalAtom(data)
+            }
+            guard let position else { return nil }
+            mapped.value = Self.iTunesPositionalAtom(number: position.number,
+                                                     total: position.total) as NSData
+        }
+        return mapped
     }
 }
 
