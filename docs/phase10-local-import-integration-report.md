@@ -200,14 +200,19 @@ APIs; no child processes at all).
 
 - Branch published: `origin/codex/local-import` @ `26faebb`
   (aed2ad8 native engine; 26faebb sha256Hex fix + regression test).
-- Integration stack published 2026-10-15: `origin/wt/t_d07f9a4d` @
-  `9cc872d` — c22618e (Music.app Apple Events engine + entitlement) →
-  4c4a1d6 (GUI/CLI wiring) → 9cc872d (security-scoped resource fix) —
-  review PR with base `codex/local-import`.
-- Review PR: https://github.com/raelldottin/tunory/pull/3 (base codex/ui-robustness).
-- Cleanup PR #4 (wt/t_d354af27) re-stacked onto the new tip via merge
-  commit `5e6d906` (fast-forward push, no force-push, no history
-  rewrite): https://github.com/raelldottin/tunory/pull/4
+- Integration stack published 2026-10-15: `origin/wt/t_d07f9a4d` — c22618e
+  (Music.app Apple Events engine + entitlement) → 4c4a1d6 (GUI/CLI
+  wiring) → 9cc872d (security-scoped resource fix) → 5da965f (this
+  report update; branch tip).
+- Review PR: **#5** (wt/t_d07f9a4d → codex/local-import):
+  https://github.com/raelldottin/tunory/pull/5
+- Stacked PR #3 (codex/local-import → codex/ui-robustness):
+  https://github.com/raelldottin/tunory/pull/3
+- Cleanup PR #4 (wt/t_d354af27) re-stacked onto the integration stack
+  via merge commit `66f64ff` (merge of wt/t_d07f9a4d into wt/t_d354af27,
+  fast-forward push, no force-push, no history rewrite); base retargeted
+  to wt/t_d07f9a4d so the PR chain is linear:
+  https://github.com/raelldottin/tunory/pull/4
 - This report: `docs/phase10-local-import-integration-report.md`.
 
 ## 7. Clean-stop classification
