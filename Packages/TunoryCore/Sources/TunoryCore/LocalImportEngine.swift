@@ -51,6 +51,15 @@ public enum ConversionDecision: String, Equatable, Sendable, Codable {
     case skipValidOutput
     /// Destination holds a valid audio file we did not produce: never
     /// overwrite; user resolves manually.
+    /// NOTE (Phase 10 audit): this case is currently UNREACHABLE in the
+    /// engine — `decision(for:)` checks destination validity BEFORE
+    /// ours-ness, so every valid destination becomes `skipValidOutput`
+    /// regardless of producer (the intended idempotency contract: never
+    /// touch a valid file, ours or not). The case is retained because
+    /// `ConversionDecision` is Codable and existing encoded outcomes and
+    /// switch-based UI must keep decoding/matching it. If decision
+    /// ordering ever changes, the safety invariant "never overwrite a
+    /// file absent from the journal" must be re-proven.
     case conflictDestinationValidForeign
     /// Destination holds an invalid/undecodable file we did not produce:
     /// never overwrite (might be an unrelated corrupt user file).
@@ -158,54 +167,11 @@ public struct LocalImportEngine: Sendable {
 
     // MARK: - Planning (pure decision logic, no I/O side effects)
 
-    /// Decide what to do with one source file. Reads (probe source,
-    /// probe destination, journal) but never writes.
-    public func plan(source: URL,
-                     outputDirectory: URL,
-                     profile: ConversionProfile,
-                     journalRecords: [LocalImportJournalRecord]) async -> (decision: ConversionDecision,
-                                                                            probe: AudioProbe?,
-                                                                            destination: URL?) {
-        // Destination path: mirror relative structure under output dir.
-        let fileName = source.deletingPathExtension().lastPathComponent
-        // Caller supplies the output root; relative structure is applied
-        // by `planBatch` (which knows the source root). For single files
-        // the destination is flat in outputDirectory.
-        let destination = outputDirectory.appendingPathComponent(fileName + ".m4a")
-
-        let probe = await prober.probe(url: source)
-        guard probe.codec != nil, probe.failureDetail == nil else {
-            return (.undecodableSource, probe, nil)
-        }
-
-        // Profile/lossiness guard (owner rule: never lossy→lossy).
-        if profile == .alac, probe.lossless != .yes {
-            return (.blockedByProfile, probe, destination)
-        }
-        if profile == .aac256, probe.lossless == .no {
-            // Lossy sources are already Music-native (mp3/aac per the
-            // research matrix); converting them is forbidden, copying
-            // would duplicate what Music imports natively — passthrough.
-            return (.passthroughNative, probe, destination)
-        }
-
-        // Destination guard (research §5 obligations): idempotent skip,
-        // reconvert-our-invalid, never touch foreign files.
-        if FileManager.default.fileExists(atPath: destination.path) {
-            let ours = journalRecords.contains { $0.destinationPath == destination.path }
-            let destProbe = await prober.probe(url: destination)
-            let destValid = destProbe.codec != nil
-                && destProbe.failureDetail == nil
-                && Self.matchesProfile(destProbe, profile: profile)
-            if destValid {
-                return (.skipValidOutput, probe, destination)
-            }
-            return ours
-                ? (.convert, probe, destination)
-                : (.conflictDestinationInvalidForeign, probe, destination)
-        }
-        return (.convert, probe, destination)
-    }
+    // NOTE: single decision authority. `decision(for:)` below is the only
+    // place a conversion decision is derived; `planFiles` and `planBatch`
+    // both route every file through it. An earlier single-file
+    // `plan(source:)` entry point duplicated that derivation, had no
+    // callers, and was removed (Phase 10 cleanup, verifier finding 2).
 
     static func matchesProfile(_ probe: AudioProbe, profile: ConversionProfile) -> Bool {
         switch profile {
@@ -213,8 +179,6 @@ public struct LocalImportEngine: Sendable {
         case .alac: return probe.codec == "alac"
         }
     }
-
-    // MARK: - Batch planning (recursive, deterministic order)
 
     /// Decide what to do with one already-probed file, given the batch
     /// context. Pure decision logic shared by every planning entry point
