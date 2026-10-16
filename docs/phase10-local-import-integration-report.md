@@ -99,10 +99,13 @@ re-verified in this phase, not re-implemented:
   the engine (decisions never re-derived in presentation code).
 - CLI: `Tunory/TunoryApp.swift` `local-import` verb — headless, same
   canonical engine, deterministic JSON output, honest exit codes
-  (0 ok / 2 usage / 3 entry failure / 4 ffmpeg unusable in sandbox).
-- Music.app import is intentionally NOT wired: no Automation entitlement;
-  the flow ends at conversion results; adding to Music.app is a manual
-  operator action. The app never touches the Music library database.
+  (0 ok / 2 usage / 3 entry conflict or failure).
+- Music.app import is wired as of `c22618e` + `4c4a1d6` (owner decision
+  D2, 2026-10-14): `MusicImportEngine` (TunoryCore) + `MusicAppScripting`
+  (in-process NSAppleScript adapter) + GUI survey → review → importing →
+  results flow + `music-import` CLI verb. `add` via Music.app Apple Events
+  is the only write; the app never touches the Music library database.
+  Live TCC proof is still pending (§4.1).
 
 ## 3. Validation evidence (objective 5)
 
@@ -113,25 +116,46 @@ sha256Hex fix), run 2026-10-14:
 |---|---|
 | `swift test` (Packages/TunoryCore) @ 26faebb | **PASS — 180/180 tests, 0 failures** (incl. native AAC/ALAC conversion, duplicate safety, unreadable-file regression, idempotency, profile blocks, destination guards) |
 | `swift test` on PR #4 re-stack merge (2ea9083 + 26faebb) | **PASS — 180/180 tests, 0 failures** |
-| `xcodebuild … Debug, platform=macOS` @ 26faebb | see §3a (re-run after report commit) |
-| `xcodebuild … Release, platform=macOS` @ 26faebb | see §3a (re-run after report commit) |
+| `xcodebuild … Debug, platform=macOS` @ 26faebb | **PASS — BUILD SUCCEEDED** (§3a, 2026-10-14) |
+| `xcodebuild … Release, platform=macOS` @ 26faebb | **PASS — BUILD SUCCEEDED** (§3a, 2026-10-14) |
 | Signed-app identity (`defaults read` on built app, run 86 & verifier re-check) | **PASS — `com.raelldottin.tunory`, display name `Tunory`, Team `DHJQ7QC53Z`** |
-| Effective entitlements (codesign on built app, verifier re-check at aed2ad8) | app-sandbox ON, user-selected read-only ON, `com.apple.security.automation.apple-events` ABSENT (per D2) |
+| Effective entitlements (codesign on built app, verifier re-check at aed2ad8) | app-sandbox ON, user-selected read-only ON, automation.apple-events ABSENT at that pre-D2 anchor (entitlement lands at c22618e; see §3a for the 9cc872d evidence) |
 | Stale identifier sweep | PASS — remaining `Turnory` / `com.raelldottin.Tunory` hits are documented historical evidence in `docs/` and AGENTS.md's canonical "do not reintroduce" list |
 | Generated-artifact tracking (`git ls-files` sweep) | PASS — no `.DS_Store`, `.build/`, `AMHelper.app/`, `xcuserdata/`, `*.xcuserstate` tracked |
 
-### 3a. Build verification at the report commit
+### 3a. Build verification at the integration tip
 
-Final validation pass, run 2026-10-14 at `codex/local-import` @ `26faebb`
-(report commit follows on the same branch):
+Validation at `codex/local-import` @ `26faebb` (native engine + sha256Hex
+fix), run 2026-10-14 (historical — predates the Music.app integration):
 
 - `xcodebuild … Debug, platform=macOS`: **PASS — BUILD SUCCEEDED** (783s).
 - `xcodebuild … Release, platform=macOS`: **PASS — BUILD SUCCEEDED** (792s).
-- Built-product identity re-verified on this fresh Debug build:
+- Built-product identity on the fresh Debug build:
   `CFBundleIdentifier = com.raelldottin.tunory`,
   `CFBundleDisplayName = Tunory`, `TeamIdentifier = DHJQ7QC53Z`;
-  entitlements: app-sandbox ON, user-selected.read-only ON,
-  apple-events ABSENT (per pending decision D2).
+  entitlements: app-sandbox ON, user-selected read-only ON,
+  `com.apple.security.automation.apple-events` ABSENT at 26faebb —
+  that entitlement enters the entitlements file at `c22618e` (owner
+  decision D2, 2026-10-14), so it is NOT part of the 26faebb evidence.
+
+Integration-tip validation (run 2026-10-15 at `wt/t_d07f9a4d` @ `9cc872d`,
+which contains c22618e + 4c4a1d6 + the security-scoped fix; full evidence
+in the t_1ffa71ab integration report §2):
+
+- `swift test` (TunoryCore): **PASS — 207/207, 0 failures**.
+- `xcodebuild test` (TunoryTests): **PASS — 35/35** (incl.
+  LocalImportViewModelSecurityScopeTests 5/5); TunoryUITests **13/13**.
+- `xcodebuild … Release, platform=macOS`: **BUILD SUCCEEDED** — first
+  Release build at 9cc872d.
+- Signed-product identity, both configurations:
+  `com.raelldottin.tunory` / `Tunory` / Team `DHJQ7QC53Z`;
+  `codesign --verify --deep --strict` OK (dev-signed; distribution
+  signing NOT exercised).
+- Effective entitlements on the built products (Debug and Release):
+  app-sandbox **ON**, automation.apple-events **ON** (landed c22618e
+  per D2), user-selected read-only **ON** (synthesized by
+  `ENABLE_USER_SELECTED_FILES = readonly` in the committed pbxproj),
+  network.client **ON**.
 
 Historical baseline (2026-10-13, dd98980, ffmpeg-era engine): swift test
 175/175 PASS; Debug and Release BUILD SUCCEEDED; live signed-app e2e
@@ -143,11 +167,11 @@ APIs; no child processes at all).
 
 ## 4. Missing runtime proof / blocked acceptance criteria
 
-1. **Music.app import (Apple Events automation) — BLOCKED on owner
-   decision D2 (no authorization yet).** No entitlement present; wiring it
-   needs the owner's explicit go-ahead plus TCC proof (Music.app scripting
-   prompt). The conversion flow ends at results; adding to Music.app is a
-   manual operator action.
+1. **Music.app import (Apple Events automation) — PENDING TCC proof.**
+  Owner decision D2 (2026-10-14) authorized the entitlement, which is now
+  present. Live TCC acceptance proof (Music.app scripting prompt) and
+  live Music.app writes (even to a disposable playlist) still need to be
+  verified.
 2. **Headless CLI source reads — BLOCKED by design.** The sandbox only
    grants reads for files picked via NSOpenPanel (GUI). A CLI caller
    passing paths on argv gets fail-closed analysis/conversion failures.
@@ -166,9 +190,9 @@ APIs; no child processes at all).
 - D1: **RESOLVED (2026-10-13)** — in-process AVFoundation/Core Audio
   conversion engine; no external ffmpeg. Implemented at `aed2ad8`,
   hardened at `26faebb`.
-- D2: **PENDING** — whether/when to add the Apple Events automation
-  entitlement and wire Music.app import (requires TCC acceptance proof).
-  Not authorized as of this report.
+- D2: **RESOLVED (2026-10-14)** — owner authorized Apple Events automation
+  entitlement and wiring Music.app import. The entitlement is now present.
+  TCC acceptance proof for live Music.app writes still pending.
 - D3: **RESOLVED as "do not merge"** — PRs #1/#2 remain open, untouched,
   merge decisions deferred to the owner.
 
@@ -176,6 +200,10 @@ APIs; no child processes at all).
 
 - Branch published: `origin/codex/local-import` @ `26faebb`
   (aed2ad8 native engine; 26faebb sha256Hex fix + regression test).
+- Integration stack published 2026-10-15: `origin/wt/t_d07f9a4d` @
+  `9cc872d` — c22618e (Music.app Apple Events engine + entitlement) →
+  4c4a1d6 (GUI/CLI wiring) → 9cc872d (security-scoped resource fix) —
+  review PR with base `codex/local-import`.
 - Review PR: https://github.com/raelldottin/tunory/pull/3 (base codex/ui-robustness).
 - Cleanup PR #4 (wt/t_d354af27) re-stacked onto the new tip via merge
   commit `5e6d906` (fast-forward push, no force-push, no history
@@ -184,9 +212,11 @@ APIs; no child processes at all).
 
 ## 7. Clean-stop classification
 
-- `codex/local-import` worktree (t_559e5375): **FULLY CLEAN** — no dirty
-  paths; branch synchronized with `origin/codex/local-import`
-  (`git rev-list --left-right --count HEAD...@{u}` = `0 0`).
+- `codex/local-import` branch: synchronized with `origin/codex/local-import`
+  (`git rev-list --left-right --count HEAD...@{u}` = `0 0`) at `c16ef31`.
+- Publication worktree (wt/t_d07f9a4d @ `9cc872d`): this report update is
+  committed on the publication branch; branch pushed to origin, no
+  force-push at any point in Phase 10.
 - Canonical checkout `/Users/raelldottin/Documents/Personal/Tunory`:
   **PROTECTED-DIRTY STOP** — upstream `codex/ui-robustness` synchronized;
   remaining dirty/untracked paths are user-owned, pre-existing, and were NOT
@@ -201,13 +231,17 @@ APIs; no child processes at all).
   180/180 @ 26faebb and on the PR #4 re-stack merge)**.
 - Debug/Release builds @ 26faebb: recorded in §3a (final pass); verifier
   independently confirmed PASS at aed2ad8 (same code, pre-report).
-- Signed-app identity/entitlements: **PASS (runtime, built product,
-  verifier re-check)** — sandbox on, no automation entitlement (per D2).
+- Signed-app identity/entitlements: **PASS (runtime, built product)** —
+  sandbox ON, automation.apple-events ON (landed c22618e per owner
+  decision D2, 2026-10-14), user-selected read-only ON; verifier
+  re-check at aed2ad8 confirmed apple-events ABSENT there (correct —
+  pre-D2 anchor).
 - Sandbox behavior under denial: **PASS (live runtime evidence,
   fail-closed verified at dd98980; native engine is in-process so the
   exec-denial class no longer exists)**.
-- Music.app automation import: **NOT ATTEMPTED (owner authorization D2
-  required)**.
+- Music.app automation import: **NOT ATTEMPTED (live TCC proof pending —
+  D2 authorizes implementation and testing incl. the TCC prompt, but no
+  live Apple Events exchange has been driven from the signed app)**.
 - Live Music library writes: **NOT ATTEMPTED (policy)**.
-- Release readiness: **NOT PROVEN (blocked on §4 items 1–2: D2
-  authorization and human acceptance)**.
+- Release readiness: **NOT PROVEN (blocked on §4 items 1–2: TCC
+  authorization for Music.app import and human acceptance)**.
