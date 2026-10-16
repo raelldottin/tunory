@@ -271,24 +271,85 @@ public struct LocalImportEngine: Sendable {
                           outputRoot: URL,
                           profile: ConversionProfile,
                           journalRecords: [LocalImportJournalRecord]) async -> LocalImportPlan {
-        var files = Self.audioFilesUnder(sourceRoot)
-        files.sort { $0.standardizedFileURL.path < $1.standardizedFileURL.path }
-        let rootPath = sourceRoot.standardizedFileURL.path
+        await planBatches(sourceRoots: [sourceRoot], outputRoot: outputRoot,
+                          profile: profile, journalRecords: journalRecords)
+    }
 
+    /// Multi-folder planning (phase 11, GAP A). The GUI folder picker
+    /// hands the user's selected folders to the SAME canonical planner
+    /// — never a second decision path. One selected root behaves
+    /// exactly like `planBatch`; multiple roots prefix each root's
+    /// entries with the selected folder's name, so selecting a parent
+    /// folder and selecting the album folders directly produce
+    /// identical destination layouts for the same collection.
+    /// Byte-duplicate detection spans all roots. Roots are
+    /// deduplicated (a panel can hand the same folder twice), and a
+    /// file reachable from two selected roots (parent + child
+    /// selection) plans exactly once — from the first root in
+    /// deterministic sorted order.
+    public func planBatches(sourceRoots: [URL],
+                            outputRoot: URL,
+                            profile: ConversionProfile,
+                            journalRecords: [LocalImportJournalRecord]) async -> LocalImportPlan {
+        var seenRoots = Set<String>()
+        var roots: [URL] = []
+        for root in sourceRoots {
+            let standardized = root.standardizedFileURL
+            if seenRoots.insert(standardized.path).inserted {
+                roots.append(standardized)
+            }
+        }
+        roots.sort { $0.path < $1.path }
+
+        let multiRoot = roots.count > 1
+        var files: [(url: URL, relativePath: String)] = []
+        var seenSources = Set<String>()
+        for root in roots {
+            let rootPath = root.path
+            let prefix = multiRoot ? root.lastPathComponent + "/" : ""
+            var rootFiles = Self.audioFilesUnder(root)
+            rootFiles.sort { $0.standardizedFileURL.path < $1.standardizedFileURL.path }
+            for file in rootFiles {
+                let path = file.standardizedFileURL.path
+                guard seenSources.insert(path).inserted else { continue }
+                let relPath = path.hasPrefix(rootPath)
+                    ? prefix + String(path.dropFirst(rootPath.count + 1))
+                    : prefix + file.lastPathComponent
+                files.append((url: file, relativePath: relPath))
+            }
+        }
+        files.sort { $0.url.standardizedFileURL.path < $1.url.standardizedFileURL.path }
+
+        let label = multiRoot
+            ? roots.map { $0.path }.joined(separator: ", ")
+            : roots.first?.path ?? ""
+        return await plan(files: files,
+                           sourceRootLabel: label,
+                           outputRoot: outputRoot,
+                           profile: profile,
+                           journalRecords: journalRecords)
+    }
+
+    /// The one canonical per-file planning loop. `files` carries each
+    /// file's batch-relative path (any album-folder prefix already
+    /// applied by the caller).
+    private func plan(files: [(url: URL, relativePath: String)],
+                      sourceRootLabel: String,
+                      outputRoot: URL,
+                      profile: ConversionProfile,
+                      journalRecords: [LocalImportJournalRecord]) async -> LocalImportPlan {
         var entries: [LocalImportPlanEntry] = []
         entries.reserveCapacity(files.count)
         var hashToFirstIndex: [String: Int] = [:]
         for (index, file) in files.enumerated() {
-            let probe = await prober.probe(url: file)
-            let relPath = file.standardizedFileURL.path.hasPrefix(rootPath)
-                ? String(file.standardizedFileURL.path.dropFirst(rootPath.count + 1))
-                : file.lastPathComponent
+            let probe = await prober.probe(url: file.url)
+            let relPath = file.relativePath
             let destination = outputRoot
                 .appendingPathComponent(relPath)
                 .deletingPathExtension()
                 .appendingPathExtension("m4a")
 
-            let sourceHash = Self.sha256Hex(fileURL: file)
+            let sourceHash = Self.sha256Hex(fileURL: file.url)
             let duplicateOf: Int? = {
                 guard let sourceHash else { return nil }
                 if let first = hashToFirstIndex[sourceHash] { return first }
@@ -314,7 +375,7 @@ public struct LocalImportEngine: Sendable {
                                          destinationIsOurs: destinationIsOurs,
                                          destinationIsValid: destinationIsValid)
 
-            entries.append(LocalImportPlanEntry(sourcePath: file.standardizedFileURL.path,
+            entries.append(LocalImportPlanEntry(sourcePath: file.url.standardizedFileURL.path,
                                                 relativePath: relPath,
                                                 destinationPath: destination.path,
                                                 sourceSHA256: sourceHash,
@@ -322,7 +383,7 @@ public struct LocalImportEngine: Sendable {
                                                 decision: decision,
                                                 duplicateOfIndex: duplicateOf))
         }
-        return LocalImportPlan(sourceRoot: rootPath,
+        return LocalImportPlan(sourceRoot: sourceRootLabel,
                                 outputRoot: outputRoot.standardizedFileURL.path,
                                 profile: profile,
                                 entries: entries)

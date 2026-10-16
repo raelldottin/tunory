@@ -100,6 +100,9 @@ final class LocalImportViewModel: ObservableObject {
     private var grantedFileURLs: [URL] = []
     private var grantedOutputDirectory: URL?
     private var selectedFiles: [URL] = []
+    /// GAP A: folders selected via the GUI folder picker (empty when
+    /// the user picked individual files). Analyze branches on this.
+    private var selectedFolders: [URL] = []
     private var reviewDecisions: [Int: Row.ReviewDecision] = [:]
     private var generation = 0
 
@@ -152,6 +155,31 @@ final class LocalImportViewModel: ObservableObject {
         selectedCount = urls.count
     }
 
+    /// GAP A (phase 11): GUI folder selection. Multi-select folders
+    /// from NSOpenPanel. Only directories count; the panel grants the
+    /// folder URL itself, so claims stay on these exact URLs (a rebuilt
+    /// file URL inside the folder is NOT the granted URL). Analyze
+    /// routes the folders to the same canonical `planBatches` planner —
+    /// folder selection is a new presentation of the SAME plan, never a
+    /// second decision path. The same folder handed twice counts once.
+    func select(folders urls: [URL]) {
+        reset()
+        let directories = urls.filter {
+            (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        }
+        guard !directories.isEmpty else { return }
+        var seen = Set<String>()
+        var unique: [URL] = []
+        for url in directories {
+            if seen.insert(url.standardizedFileURL.path).inserted {
+                unique.append(url)
+            }
+        }
+        grantedFileURLs = unique
+        selectedFolders = unique.sorted { $0.standardizedFileURL.path < $1.standardizedFileURL.path }
+        selectedCount = unique.count
+    }
+
     func setProfile(_ newProfile: ConversionProfile) {
         profile = newProfile
     }
@@ -159,7 +187,7 @@ final class LocalImportViewModel: ObservableObject {
     // MARK: - Analyze (all decisions from the engine)
 
     func analyze(outputDirectory: URL) async {
-        guard !selectedFiles.isEmpty else { return }
+        guard !selectedFiles.isEmpty || !selectedFolders.isEmpty else { return }
         generation &+= 1
         let revision = generation
         self.outputDirectory = outputDirectory
@@ -169,8 +197,8 @@ final class LocalImportViewModel: ObservableObject {
         reviewDecisions = [:]
 
         // Claim every powerbox grant this read touches (selected files
-        // + destination directory, whose contents the destination guard
-        // probes), and release on every exit path.
+        // or folders + destination directory, whose contents the
+        // destination guard probes), and release on every exit path.
         let claims = SecurityScopedClaims(claiming: securityScopedAccess)
         defer { claims.release() }
         for url in grantedFileURLs { claims.claim(url) }
@@ -180,10 +208,22 @@ final class LocalImportViewModel: ObservableObject {
         let (records, warning) = (try? journal.load()) ?? ([], nil)
         journalWarning = warning
 
-        let plan = await engine.planFiles(files: selectedFiles,
+        // One canonical planner for every selection mode: files go
+        // through planFiles; folders through planBatches (which the
+        // single-root batch walk also delegates to). Never a second
+        // decision path.
+        let plan: LocalImportPlan
+        if selectedFolders.isEmpty {
+            plan = await engine.planFiles(files: selectedFiles,
                                           outputDirectory: outputDirectory,
                                           profile: profile,
                                           journalRecords: records)
+        } else {
+            plan = await engine.planBatches(sourceRoots: selectedFolders,
+                                            outputRoot: outputDirectory,
+                                            profile: profile,
+                                            journalRecords: records)
+        }
         guard revision == generation else { return }
         rows = plan.entries.enumerated().map { index, entry in
             Row(id: index, planEntry: entry, reviewDecision: .notReviewed)
@@ -413,6 +453,7 @@ final class LocalImportViewModel: ObservableObject {
         grantedFileURLs = []
         grantedOutputDirectory = nil
         selectedFiles = []
+        selectedFolders = []
         selectedCount = 0
         rows = []
         reviewDecisions = [:]

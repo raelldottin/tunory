@@ -213,6 +213,167 @@ final class LocalImportEngineTests: XCTestCase {
         XCTAssertNil(plan.entries[1].sourceSHA256)
     }
 
+    // MARK: - Multi-root folder planning (GAP A, phase 11)
+
+    /// Minimal valid mono 16-bit PCM WAV (~1 s), hand-built so folder
+    /// planning tests never depend on ffmpeg. WAV is lossless (lpcm),
+    /// so it plans as `.convert` under the AAC-256 reference profile.
+    static func makeWAVFixture(at url: URL, frequency: Double = 440) throws {
+        let sampleRate = 44_100.0
+        let frames = Int(sampleRate)
+        var samples = [Int16](repeating: 0, count: frames)
+        for i in 0..<frames {
+            let t = Double(i) / sampleRate
+            samples[i] = Int16((sin(2 * .pi * frequency * t) * 0.4) * Double(Int16.max))
+        }
+        var data = Data()
+        func append(_ s: String) { data.append(s.data(using: .ascii)!) }
+        func append32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        func append16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        append("RIFF"); append32(UInt32(36 + frames * 2)); append("WAVE")
+        append("fmt "); append32(16); append16(1); append16(1)
+        append32(UInt32(sampleRate)); append32(UInt32(sampleRate * 2)); append16(2); append16(16)
+        append("data"); append32(UInt32(frames * 2))
+        for s in samples { append16(UInt16(bitPattern: s)) }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try data.write(to: url)
+    }
+
+    /// A single selected folder must plan exactly like the CLI batch
+    /// walk — the GUI folder picker is a new presentation of the SAME
+    /// canonical plan, never a second decision path.
+    func testPlanBatchesSingleRootEqualsPlanBatch() async throws {
+        let album = work.appendingPathComponent("AlbumA", isDirectory: true)
+        try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
+        try Self.makeWAVFixture(at: album.appendingPathComponent("01 Track.wav"))
+        let engine = LocalImportEngine()
+        let out = work.appendingPathComponent("out")
+        let batch = await engine.planBatch(sourceRoot: album, outputRoot: out,
+                                           profile: .aac256, journalRecords: [])
+        let batches = await engine.planBatches(sourceRoots: [album], outputRoot: out,
+                                               profile: .aac256, journalRecords: [])
+        XCTAssertEqual(batch.entries, batches.entries,
+                       "single-root planBatches must equal planBatch entry for entry")
+    }
+
+    /// Multiple selected album folders: each root's entries carry the
+    /// album folder name as prefix, so same-named tracks in different
+    /// albums plan to distinct per-album destinations (no collision).
+    func testPlanBatchesMultipleRootsPreservePerAlbumStructure() async throws {
+        for album in ["AlbumA", "AlbumB"] {
+            let dir = work.appendingPathComponent(album, isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Self.makeWAVFixture(at: dir.appendingPathComponent("01 Track.wav"))
+        }
+        let engine = LocalImportEngine()
+        let out = work.appendingPathComponent("out")
+        let plan = await engine.planBatches(
+            sourceRoots: [work.appendingPathComponent("AlbumA"),
+                          work.appendingPathComponent("AlbumB")],
+            outputRoot: out, profile: .aac256, journalRecords: [])
+        XCTAssertEqual(plan.entries.count, 2)
+        XCTAssertEqual(plan.entries.map(\.relativePath).sorted(),
+                       ["AlbumA/01 Track.wav", "AlbumB/01 Track.wav"],
+                       "each root's entries must be prefixed with the album folder name")
+        XCTAssertEqual(plan.entries.map(\.destinationPath).sorted(),
+                       [out.appendingPathComponent("AlbumA/01 Track.m4a").path,
+                        out.appendingPathComponent("AlbumB/01 Track.m4a").path].sorted(),
+                       "same-named tracks in different albums must not collide at the destination")
+        for entry in plan.entries {
+            XCTAssertEqual(entry.decision, .convert,
+                           "valid lossless WAVs must plan as convert under AAC-256")
+        }
+    }
+
+    /// Requirement 1's two selection modes must be equivalent: selecting
+    /// the parent folder or selecting the album folders directly
+    /// produces the same plan for the same collection.
+    func testPlanBatchesParentSelectionMatchesAlbumsSelection() async throws {
+        for album in ["AlbumA", "AlbumB"] {
+            let dir = work.appendingPathComponent(album, isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Self.makeWAVFixture(at: dir.appendingPathComponent("01 Track.wav"))
+        }
+        let engine = LocalImportEngine()
+        let out = work.appendingPathComponent("out")
+        let parentPlan = await engine.planBatches(sourceRoots: [work], outputRoot: out,
+                                                  profile: .aac256, journalRecords: [])
+        let albumsPlan = await engine.planBatches(
+            sourceRoots: [work.appendingPathComponent("AlbumA"),
+                          work.appendingPathComponent("AlbumB")],
+            outputRoot: out, profile: .aac256, journalRecords: [])
+        XCTAssertEqual(parentPlan.entries, albumsPlan.entries,
+                       "parent-folder and album-folder selection must produce identical plans")
+    }
+
+    /// Byte-identical recordings in two different selected folders must
+    /// still be flagged as batch duplicates for explicit review.
+    func testPlanBatchesFlagsByteDuplicatesAcrossFolders() async throws {
+        let a = work.appendingPathComponent("AlbumA", isDirectory: true)
+        let b = work.appendingPathComponent("AlbumB", isDirectory: true)
+        try FileManager.default.createDirectory(at: a, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: b, withIntermediateDirectories: true)
+        try Self.makeWAVFixture(at: a.appendingPathComponent("shared.wav"))
+        try FileManager.default.copyItem(at: a.appendingPathComponent("shared.wav"),
+                                         to: b.appendingPathComponent("same-bytes.wav"))
+        let engine = LocalImportEngine()
+        let plan = await engine.planBatches(sourceRoots: [a, b],
+                                            outputRoot: work.appendingPathComponent("out"),
+                                            profile: .aac256, journalRecords: [])
+        XCTAssertEqual(plan.entries.count, 2)
+        let first = plan.entries.first { $0.sourcePath.hasSuffix("shared.wav") }!
+        let second = plan.entries.first { $0.sourcePath.hasSuffix("same-bytes.wav") }!
+        XCTAssertNil(first.duplicateOfIndex)
+        XCTAssertNotNil(second.duplicateOfIndex,
+                        "byte-identical recordings across two selected folders must be flagged for review")
+    }
+
+    /// The same folder handed twice (panel quirk) must plan once —
+    /// deterministic, no double walk.
+    func testPlanBatchesPlansIdenticalRootOnce() async throws {
+        let album = work.appendingPathComponent("AlbumA", isDirectory: true)
+        try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
+        try Self.makeWAVFixture(at: album.appendingPathComponent("01 Track.wav"))
+        let engine = LocalImportEngine()
+        let plan = await engine.planBatches(sourceRoots: [album, album],
+                                            outputRoot: work.appendingPathComponent("out"),
+                                            profile: .aac256, journalRecords: [])
+        XCTAssertEqual(plan.entries.count, 1,
+                       "an identical root handed twice must plan exactly once")
+    }
+
+    /// Adversarial edge: two DIFFERENT roots that share a folder name
+    /// ("Greatest Hits" from two parents) prefix to the same relative
+    /// paths, so their destinations collide. Planning must stay
+    /// deterministic and honest: both entries present, both `.convert`
+    /// (a plan never writes); the promote-time destination guard owns
+    /// the actual collision — a foreign file is never overwritten.
+    func testPlanBatchesSameNamedRootsCollideDeterministically() async throws {
+        let parent1 = work.appendingPathComponent("col1", isDirectory: true)
+        let parent2 = work.appendingPathComponent("col2", isDirectory: true)
+        let r1 = parent1.appendingPathComponent("Greatest", isDirectory: true)
+        let r2 = parent2.appendingPathComponent("Greatest", isDirectory: true)
+        try FileManager.default.createDirectory(at: r1, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: r2, withIntermediateDirectories: true)
+        try Self.makeWAVFixture(at: r1.appendingPathComponent("01.wav"), frequency: 440)
+        try Self.makeWAVFixture(at: r2.appendingPathComponent("01.wav"), frequency: 660)
+        let engine = LocalImportEngine()
+        let plan = await engine.planBatches(sourceRoots: [r1, r2],
+                                            outputRoot: work.appendingPathComponent("out"),
+                                            profile: .aac256, journalRecords: [])
+        XCTAssertEqual(plan.entries.count, 2)
+        XCTAssertEqual(Set(plan.entries.map(\.destinationPath)).count, 1,
+                       "same-named roots document a real destination edge: identical planned paths")
+        XCTAssertEqual(plan.entries.map(\.sourcePath),
+                       plan.entries.map(\.sourcePath).sorted(),
+                       "entries stay deterministically ordered")
+        for entry in plan.entries {
+            XCTAssertEqual(entry.decision, .convert,
+                           "planning never writes; the promote-time guard owns the collision")
+        }
+    }
+
     // MARK: - Native conversion (D1 acceptance: in-process, no external binary)
 
     func testConvertFLACToM4AReferenceProfile() async throws {

@@ -57,16 +57,34 @@ struct LocalImportView: View {
         }
     }
 
+    /// GAP A (phase 11): powerbox folder picker — multi-select album
+    /// folders. Presentation only: every decision stays in the model
+    /// (`select(folders:)` → the same canonical planner).
+    private func presentFolderPicker() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Select"
+        panel.message = "Choose one or more folders of audio files. Each selected folder's name becomes the destination subfolder."
+        panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.windows.first!) { response in
+            guard response == .OK else { return }
+            let urls = panel.urls
+            guard !urls.isEmpty else { return }
+            model.select(folders: urls)
+        }
+    }
+
     // MARK: - Select
 
     private var selectBody: some View {
         Group {
             TunoryNotice(title: "Import local audio files",
-                         message: "Select audio files (FLAC, MP3, M4A, WAV, AIFF). Tunory inspects actual file content — never the filename — and converts only what Music.app cannot use directly. Original files are never modified.",
+                         message: "Select audio files or folders (FLAC, MP3, M4A, WAV, AIFF). Tunory inspects actual file content — never the filename — and converts only what Music.app cannot use directly. Original files are never modified.",
                          symbol: "folder")
             if model.selectedCount > 0 {
                 GroupBox("Selected") {
-                    Text("\(model.selectedCount) file(s) selected.")
+                    Text("\(model.selectedCount) item(s) selected.")
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityIdentifier("local.selectedCount")
                 }
@@ -75,6 +93,9 @@ struct LocalImportView: View {
                 Button("Select Files…") { showFileImporter = true }
                     .buttonStyle(.borderedProminent)
                     .accessibilityIdentifier("local.selectFiles")
+                Button("Select Folder(s)…") { presentFolderPicker() }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("local.selectFolders")
                 if model.selectedCount > 0 {
                     Button("Choose Destination…") { presentOutputPicker() }
                         .buttonStyle(.bordered)
