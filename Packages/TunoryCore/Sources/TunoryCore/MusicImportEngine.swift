@@ -39,6 +39,18 @@ public struct MusicTrackRef: Equatable, Sendable, Codable {
     public let persistentID: String
     /// Track name as shown in Music.app.
     public let name: String?
+    /// Track artist, when Music reports it (GAP C comparison axis).
+    public let artist: String?
+    /// Album name, when Music reports it (GAP C comparison axis).
+    public let album: String?
+    /// Album artist, when Music reports it (GAP C comparison axis;
+    /// compared separately from the track artist so compilations are
+    /// never conflated with single-artist releases).
+    public let albumArtist: String?
+    /// Disc number, when Music reports it (GAP C comparison axis).
+    public let discNumber: Int?
+    /// Track number, when Music reports it (GAP C comparison axis).
+    public let trackNumber: Int?
     /// POSIX path string of the track's file, if any.
     public let locationPath: String?
     /// Track duration in seconds, if reported.
@@ -46,10 +58,20 @@ public struct MusicTrackRef: Equatable, Sendable, Codable {
 
     public init(persistentID: String,
                 name: String?,
-                locationPath: String?,
-                durationSeconds: Double?) {
+                artist: String? = nil,
+                album: String? = nil,
+                albumArtist: String? = nil,
+                discNumber: Int? = nil,
+                trackNumber: Int? = nil,
+                locationPath: String? = nil,
+                durationSeconds: Double? = nil) {
         self.persistentID = persistentID
         self.name = name
+        self.artist = artist
+        self.album = album
+        self.albumArtist = albumArtist
+        self.discNumber = discNumber
+        self.trackNumber = trackNumber
         self.locationPath = locationPath
         self.durationSeconds = durationSeconds
     }
@@ -60,6 +82,11 @@ public struct MusicLibraryCandidate: Equatable, Sendable, Codable {
     public enum MatchKind: String, Equatable, Sendable, Codable {
         /// Music reports a track whose file is byte-identical (SHA-256).
         case exactDuplicate
+        /// All six metadata axes present and equal on both sides AND both
+        /// durations present and within tolerance - a cross-format
+        /// same-recording match (FLAC candidate vs existing AAC). The
+        /// duplicate field carries the proven twin as evidence.
+        case verifiedExisting
         /// Metadata candidates exist but none provably identical - the
         /// user must explicitly resolve (owner rule: never auto-resolve).
         case needsReview
@@ -235,6 +262,10 @@ public enum MusicImportDecision: String, Equatable, Sendable, Codable {
     case importCandidate
     /// Byte-identical track already in the library - do not re-import.
     case skipExactDuplicate
+    /// Same recording already present, proven by full six-axis metadata
+    /// equality plus duration agreement (cross-format twin, e.g. FLAC
+    /// candidate vs existing AAC) - do not re-import.
+    case skipVerifiedExisting
     /// Metadata candidates exist but none provably identical - the user
     /// must explicitly resolve (owner rule: never auto-resolve).
     case reviewRequired
@@ -302,42 +333,107 @@ public struct MusicImportEngine: Sendable {
 
     // MARK: - Planning (pure decision logic over read-only surveys)
 
+    /// Duration agreement tolerance for the verified-existing rule: two
+    /// encodings of the same recording decode/report duration
+    /// independently, so exact equality is impossible across formats;
+    /// remasters and alternate mixes are typically several seconds or
+    /// more apart, which lands them in review instead of a skip.
+    public static let metadataDurationToleranceSeconds: Double = 2.0
+
     /// Survey result for one file, using already-fetched library tracks.
     ///
-    /// Duplicate funnel (t_dc244b34 §6): metadata candidate search by
-    /// title, then byte-compare each candidate's file at its `location`
-    /// against the import candidate. Byte-identical -> exact duplicate
-    /// (skip). Metadata match with different/unreadable bytes -> review.
-    /// No candidates -> import candidate.
+    /// Duplicate funnel (t_dc244b34 §6, GAP C phase 11): per track, in
+    /// deterministic order:
+    ///   1. no file location -> review (streaming tracks can't be proven);
+    ///   2. byte-identical (SHA-256) -> exactDuplicate (strongest proof);
+    ///   3. all six metadata axes present on BOTH sides and exactly
+    ///      equal, AND both durations present and within ±tolerance ->
+    ///      verifiedExisting (cross-format same-recording twin);
+    ///   4. anything else -> review. Ambiguity never auto-imports and
+    ///      never auto-skips.
+    /// Empty library -> noCandidate.
     public func plan(filePath: String,
                      candidateHash: String?,
+                     candidateTags: AudioMetadataTags? = nil,
+                     candidateDurationSeconds: Double? = nil,
                      libraryTracks: [MusicTrackRef]) -> MusicLibraryCandidate {
         Self.classify(filePath: filePath,
                       candidateHash: candidateHash,
+                      candidateTags: candidateTags,
+                      candidateDurationSeconds: candidateDurationSeconds,
                       libraryTracks: libraryTracks)
     }
 
     /// End-to-end READ-ONLY survey of one import candidate against live
-    /// library state: derives the canonical title query, runs the metadata
-    /// search, and classifies. No write is issued and no journal record is
-    /// written. Returns nil when the survey itself fails (Music busy,
-    /// script error, timeout) - callers must treat nil as a fail-stop,
-    /// never as "no candidates".
-    public func surveyFile(file: URL) async -> MusicLibraryCandidate? {
-        let query = Self.titleQuery(forFileAt: file.path)
+    /// library state. Derives the search query (tag title preferred,
+    /// filename derivation as fallback), runs the metadata search, loads
+    /// the candidate's own tags when not supplied, and classifies. No
+    /// write is issued and no journal record is written. Returns nil
+    /// when the survey itself fails (Music busy, script error, timeout) -
+    /// callers must treat nil as a fail-stop, never as "no candidates".
+    public func surveyFile(file: URL,
+                            candidateTags: AudioMetadataTags? = nil,
+                            candidateDurationSeconds: Double? = nil) async -> MusicLibraryCandidate? {
+        // Self-loading (design item 5): when the caller did not supply
+        // tags/duration, derive them from the file itself - BEFORE the
+        // query is derived, so a tag-bearing file gets the tag-title
+        // query even when the caller passed nothing. Classification
+        // never depends on the caller having pre-probed the candidate.
+        let tags: AudioMetadataTags?
+        let duration: Double?
+        if let candidateTags, let candidateDurationSeconds {
+            tags = candidateTags
+            duration = candidateDurationSeconds
+        } else {
+            let loaded = await Self.loadCandidateTags(file: file)
+            tags = candidateTags ?? loaded?.tags
+            duration = candidateDurationSeconds ?? loaded?.duration
+        }
+        let query = Self.surveyQuery(tagTitle: tags?.title,
+                                      fallback: Self.titleQuery(forFileAt: file.path))
         guard let libraryTracks = await scripting.searchLibrary(query: query) else {
             return nil
         }
         let hash = LocalImportEngine.sha256Hex(fileURL: file)
         return Self.classify(filePath: file.path,
                              candidateHash: hash,
+                             candidateTags: tags,
+                             candidateDurationSeconds: duration,
                              libraryTracks: libraryTracks)
+    }
+
+    /// Candidate tags + decoded duration, read from the candidate file
+    /// itself. Tags come from the single GAP B mapping (AudioProber
+    /// mirrors LocalImportEngine.applyMetadata's read side); duration is
+    /// the decoded duration AudioProber already derives. Either may be
+    /// missing on undecodable/tagless files - classification then stays
+    /// conservative (review), never guessed.
+    static func loadCandidateTags(file: URL) async -> (tags: AudioMetadataTags?,
+                                                       duration: Double?)? {
+        let prober = AudioProber()
+        let probe = await prober.probe(url: file)
+        let tags = await prober.loadTags(url: file)
+        return (tags, probe.durationSeconds)
+    }
+
+    /// Canonical survey query: prefer the candidate's tag title (Music's
+    /// `search` is contains-match, so the tag title finds recordings the
+    /// fallback derivation would miss); otherwise use the fallback
+    /// (filename derivation for surveyFile, the caller-provided
+    /// titleQuery for importFile). Deterministic: same inputs -> same query.
+    static func surveyQuery(tagTitle: String?, fallback: String) -> String {
+        if let tagTitle, !tagTitle.isEmpty {
+            return tagTitle
+        }
+        return fallback
     }
 
     /// Pure classification shared by planning and reconciliation: the
     /// single place a duplicate/collision decision is derived.
     static func classify(filePath: String,
                          candidateHash: String?,
+                         candidateTags: AudioMetadataTags? = nil,
+                         candidateDurationSeconds: Double? = nil,
                          libraryTracks: [MusicTrackRef]) -> MusicLibraryCandidate {
         guard FileManager.default.fileExists(atPath: filePath) else {
             return MusicLibraryCandidate(matchKind: .undecodableCandidate,
@@ -368,6 +464,17 @@ public struct MusicImportEngine: Sendable {
                                              candidates: [],
                                              duplicate: track)
             }
+            // Cross-format verified-existing: byte-identical was disproven,
+            // so prove same-recording by the six metadata axes plus
+            // duration agreement. Every axis must be present on BOTH
+            // sides - a missing axis is unprovable, not a wildcard.
+            if Self.sameRecording(candidateTags: candidateTags,
+                                  candidateDurationSeconds: candidateDurationSeconds,
+                                  libraryTrack: track) {
+                return MusicLibraryCandidate(matchKind: .verifiedExisting,
+                                             candidates: [],
+                                             duplicate: track)
+            }
             reviewList.append(track)
         }
         return MusicLibraryCandidate(matchKind: libraryTracks.isEmpty ? .noCandidate : .needsReview,
@@ -375,11 +482,41 @@ public struct MusicImportEngine: Sendable {
                                      duplicate: nil)
     }
 
+    /// The conservative cross-format same-recording rule (GAP C): all six
+    /// metadata axes (title, artist, album, album artist, disc, track)
+    /// present on BOTH sides and exactly equal, and both durations
+    /// present and within the ±tolerance band. Exact string equality -
+    /// no case folding, no trimming: near-misses go to review, never a
+    /// silent skip. A missing axis or duration is unprovable -> false.
+    static func sameRecording(candidateTags: AudioMetadataTags?,
+                              candidateDurationSeconds: Double?,
+                              libraryTrack: MusicTrackRef) -> Bool {
+        guard let tags = candidateTags else { return false }
+        guard let candidateDuration = candidateDurationSeconds,
+              let libraryDuration = libraryTrack.durationSeconds else {
+            return false
+        }
+        guard abs(candidateDuration - libraryDuration)
+                <= Self.metadataDurationToleranceSeconds else {
+            return false
+        }
+        guard let title = tags.title, title == libraryTrack.name,
+              let artist = tags.artist, artist == libraryTrack.artist,
+              let album = tags.album, album == libraryTrack.album,
+              let albumArtist = tags.albumArtist, albumArtist == libraryTrack.albumArtist,
+              let disc = tags.discNumber, disc == libraryTrack.discNumber,
+              let track = tags.trackNumber, track == libraryTrack.trackNumber else {
+            return false
+        }
+        return true
+    }
+
     /// Decision for one file, derived only from its survey. Deterministic.
     public static func decision(for survey: MusicLibraryCandidate) -> MusicImportDecision {
         switch survey.matchKind {
         case .noCandidate: return .importCandidate
         case .exactDuplicate: return .skipExactDuplicate
+        case .verifiedExisting: return .skipVerifiedExisting
         case .needsReview: return .reviewRequired
         case .undecodableCandidate: return .undecodableFile
         }
@@ -408,6 +545,8 @@ public struct MusicImportEngine: Sendable {
     @discardableResult
     public func importFile(file: URL,
                            titleQuery: String,
+                           candidateTags: AudioMetadataTags? = nil,
+                           candidateDurationSeconds: Double? = nil,
                            journal: MusicImportJournal,
                            priorRecords: [MusicImportJournalRecord],
                            reviewResolved: Bool = false) async -> MusicImportOutcome {
@@ -451,10 +590,27 @@ public struct MusicImportEngine: Sendable {
                                       detail: "prior verified import recorded in journal")
         }
 
+        // Self-load tags/duration the caller did not supply (design item
+        // 5): the duplicate survey must not depend on the caller having
+        // pre-probed the candidate. Missing/unparseable axes stay nil and
+        // classification stays conservative (review).
+        var tags = candidateTags
+        var duration = candidateDurationSeconds
+        if tags == nil || duration == nil {
+            if let loaded = await Self.loadCandidateTags(file: file) {
+                if tags == nil { tags = loaded.tags }
+                if duration == nil { duration = loaded.duration }
+            }
+        }
+
         // Read-only duplicate survey before any write. A failed survey
         // (nil) is a fail-visible STOP: it must never be read as "no
         // candidates" (that would auto-import a possible duplicate).
-        guard let libraryTracks = await scripting.searchLibrary(query: titleQuery) else {
+        // The query prefers the candidate's tag title (design item 5);
+        // the caller-provided titleQuery is the documented fallback.
+        let query = Self.surveyQuery(tagTitle: tags?.title,
+                                     fallback: titleQuery)
+        guard let libraryTracks = await scripting.searchLibrary(query: query) else {
             record(.failed, hash, nil, nil)
             return MusicImportOutcome(filePath: path, status: .failed,
                                       decision: .reviewRequired,
@@ -462,14 +618,21 @@ public struct MusicImportEngine: Sendable {
                                       detail: "duplicate survey failed - reconcile against Music.app state before importing")
         }
         let survey = Self.classify(filePath: path,
-                                   candidateHash: hash,
-                                   libraryTracks: libraryTracks)
+                                    candidateHash: hash,
+                                    candidateTags: tags,
+                                    candidateDurationSeconds: duration,
+                                    libraryTracks: libraryTracks)
         switch Self.decision(for: survey) {
         case .skipExactDuplicate:
             return MusicImportOutcome(filePath: path, status: .skippedDuplicate,
                                       decision: .skipExactDuplicate,
                                       persistentID: survey.duplicate?.persistentID,
                                       detail: "byte-identical track already in library")
+        case .skipVerifiedExisting:
+            return MusicImportOutcome(filePath: path, status: .skippedDuplicate,
+                                      decision: .skipVerifiedExisting,
+                                      persistentID: survey.duplicate?.persistentID,
+                                      detail: "verified-existing same recording (six metadata axes + duration within tolerance) already in library")
         case .reviewRequired:
             // The only path past a review is an EXPLICIT user resolution
             // (owner rule: never auto-resolved). Even then, the fresh
