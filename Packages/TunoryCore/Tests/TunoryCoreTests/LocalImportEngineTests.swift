@@ -120,6 +120,93 @@ final class LocalImportEngineTests: XCTestCase {
         XCTAssertTrue(probe.musicImportable)
     }
 
+    // MARK: - GAP C item 3: standalone tags loader (six axes)
+
+    func testLoadTagsSixAxesFromVorbisComments() async throws {
+        // Full vorbis axis set the classifier compares, incl. the three
+        // GAP B extended fields (ALBUMARTIST/DISCNUMBER/TRACKNUMBER).
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        let flac = work.appendingPathComponent("tagged.flac")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                                "-f", "flac", "-c:a", "flac",
+                                "-metadata", "title=Golden Hour",
+                                "-metadata", "artist=Artist",
+                                "-metadata", "album=Album",
+                                "-metadata", "ALBUMARTIST=Album Artist",
+                                "-metadata", "DISCNUMBER=2",
+                                "-metadata", "TRACKNUMBER=7/12",
+                                flac.path])
+        let tags = await AudioProber().loadTags(url: flac)
+        XCTAssertNotNil(tags)
+        XCTAssertEqual(tags?.title, "Golden Hour")
+        XCTAssertEqual(tags?.artist, "Artist")
+        XCTAssertEqual(tags?.album, "Album")
+        XCTAssertEqual(tags?.albumArtist, "Album Artist")
+        XCTAssertEqual(tags?.discNumber, 2, "vorbis DISCNUMBER must parse via the GAP B mapping")
+        XCTAssertEqual(tags?.trackNumber, 7, "vorbis 'n/total' TRACKNUMBER must yield the number")
+    }
+
+    func testLoadTagsReusesID3Mapping() async throws {
+        // The GAP B source-identifier table is the single mapping: id3
+        // TPE2/TPOS/TRCK must reach the loader exactly like vorbis.
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        let mp3 = work.appendingPathComponent("id3tagged.mp3")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=550:duration=3",
+                                "-c:a", "libmp3lame", "-b:a", "128k", "-id3v2_version", "3",
+                                "-metadata", "title=ID3 Tone",
+                                "-metadata", "TPE2=ID3 Album Artist",
+                                "-metadata", "TPOS=2/2", "-metadata", "TRCK=7/12",
+                                mp3.path])
+        let tags = await AudioProber().loadTags(url: mp3)
+        XCTAssertNotNil(tags)
+        XCTAssertEqual(tags?.title, "ID3 Tone")
+        XCTAssertEqual(tags?.albumArtist, "ID3 Album Artist")
+        XCTAssertEqual(tags?.discNumber, 2)
+        XCTAssertEqual(tags?.trackNumber, 7)
+    }
+
+    func testLoadTagsTaglessFileYieldsAllNilAxes() async throws {
+        let bare = try makeFLAC(name: "bare.flac", metadata: false)
+        let tags = await AudioProber().loadTags(url: bare)
+        XCTAssertEqual(tags, AudioMetadataTags(title: nil, artist: nil, album: nil,
+                                               albumArtist: nil, discNumber: nil,
+                                               trackNumber: nil),
+                       "a tagless file must load all-nil axes, never guessed values")
+    }
+
+    func testLoadTagsCorruptFileIsFailVisible() async throws {
+        let corrupt = work.appendingPathComponent("corrupt-tags.flac")
+        try makeCorruptFile(corrupt)
+        let tags = await AudioProber().loadTags(url: corrupt)
+        // Fail-visible: either the survey fails outright (nil) or every
+        // axis is nil. Never invented values.
+        if let tags {
+            XCTAssertEqual(tags, AudioMetadataTags(title: nil, artist: nil, album: nil,
+                                                  albumArtist: nil, discNumber: nil,
+                                                  trackNumber: nil))
+        }
+    }
+
+    func testLoadTagsGarbagePositionalTagsStayNil() async throws {
+        // "handle various FLAC tag formats gracefully": unparseable
+        // positional values must be skipped, never guessed.
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        let flac = work.appendingPathComponent("garbage.flac")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                                "-f", "flac", "-c:a", "flac",
+                                "-metadata", "title=Garbage",
+                                "-metadata", "TRACKNUMBER=not-a-number",
+                                "-metadata", "DISCNUMBER=-1",
+                                flac.path])
+        let tags = await AudioProber().loadTags(url: flac)
+        XCTAssertEqual(tags?.title, "Garbage")
+        XCTAssertNil(tags?.trackNumber, "unparseable TRACKNUMBER must stay nil")
+        XCTAssertNil(tags?.discNumber, "negative DISCNUMBER must stay nil")
+    }
+
     // MARK: - Planning (deterministic decisions)
 
     func testPlanPassthroughForLossySources() async throws {

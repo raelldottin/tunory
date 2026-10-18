@@ -78,6 +78,39 @@ public struct AudioProbe: Equatable, Sendable, Codable {
     }
 }
 
+/// Six-axis metadata tags for one audio file, as consumed by the
+/// duplicate-preflight classifier (GAP C, phase 11, design item 3).
+///
+/// Exactly the classifier's comparison axes: title, artist, album,
+/// album artist, disc number, track number. Duration deliberately does
+/// NOT live here — decoded duration already exists on `AudioProbe`, and
+/// the classifier compares it as a separate tolerance rule. `nil` on an
+/// axis means "not present or not parseable": identity is then
+/// unprovable, which the classifier must route to review — never a
+/// wildcard match.
+public struct AudioMetadataTags: Equatable, Sendable {
+    public let title: String?
+    public let artist: String?
+    public let album: String?
+    public let albumArtist: String?
+    public let discNumber: Int?
+    public let trackNumber: Int?
+
+    public init(title: String?,
+                artist: String?,
+                album: String?,
+                albumArtist: String?,
+                discNumber: Int?,
+                trackNumber: Int?) {
+        self.title = title
+        self.artist = artist
+        self.album = album
+        self.albumArtist = albumArtist
+        self.discNumber = discNumber
+        self.trackNumber = trackNumber
+    }
+}
+
 /// Probes files with AVFoundation (content-based, not extension-based).
 /// Async by contract: modern AVFoundation track loading is async-only, and
 /// callers own the scheduling (view-models use Task, CLI awaits).
@@ -196,6 +229,94 @@ public struct AudioProber: Sendable {
         case "mp3", "aac": return .no
         default: return .unknown
         }
+    }
+
+    // MARK: - Tags loading (GAP C, phase 11, design item 3)
+
+    /// Standalone six-axis tags loader for the duplicate-preflight
+    /// engine. Reads exactly the classifier's comparison axes from the
+    /// file's own metadata, mirroring `LocalImportEngine.applyMetadata`'s
+    /// read side so conversion and classification derive from ONE
+    /// mapping:
+    ///   * title / artist / album via AVMetadataItem.commonKey;
+    ///   * albumArtist / disc / track via the GAP B source-identifier
+    ///     table (LocalImportEngine.extendedSourceIdentifiers +
+    ///     parsePositionalTag / parsePositionalAtom) — single source of
+    ///     the vorbis / id3 / itsk mapping.
+    ///
+    /// Deterministic: the first readable value per axis wins (metadata
+    /// format order is stable for a given file); totals of "n/total"
+    /// positional tags are parsed for validity but not kept — the
+    /// classifier compares numbers only. Missing or unparseable axes
+    /// stay nil: identity is then unprovable, and the classifier must
+    /// route to review — never a wildcard match. Returns nil only when
+    /// the metadata survey itself fails (unreadable file): fail-visible,
+    /// never guessed.
+    public func loadTags(url: URL) async -> AudioMetadataTags? {
+        let asset = AVURLAsset(url: url)
+        guard let formats = try? await asset.load(.availableMetadataFormats) else {
+            return nil
+        }
+        var title: String?
+        var artist: String?
+        var album: String?
+        var albumArtist: String?
+        var discNumber: Int?
+        var trackNumber: Int?
+        for format in formats {
+            let formatItems = (try? await asset.loadMetadata(for: format)) ?? []
+            for item in formatItems {
+                // Extended fields first: they have NO common key, so the
+                // commonKey path below can never carry them (GAP B).
+                if let identifier = item.identifier,
+                   let field = LocalImportEngine.extendedSourceIdentifiers[identifier.rawValue] {
+                    switch field {
+                    case .albumArtist:
+                        if albumArtist == nil,
+                           let value = try? await item.load(.stringValue),
+                           !value.isEmpty {
+                            albumArtist = value
+                        }
+                    case .discNumber:
+                        if discNumber == nil {
+                            discNumber = await Self.positionalNumberOf(item)
+                        }
+                    case .trackNumber:
+                        if trackNumber == nil {
+                            trackNumber = await Self.positionalNumberOf(item)
+                        }
+                    }
+                    continue
+                }
+                guard let commonKey = item.commonKey,
+                      let value = try? await item.load(.stringValue) else { continue }
+                switch commonKey {
+                case .commonKeyTitle where title == nil: title = value
+                case .commonKeyArtist where artist == nil: artist = value
+                case .commonKeyAlbumName where album == nil: album = value
+                default: continue
+                }
+            }
+        }
+        return AudioMetadataTags(title: title, artist: artist, album: album,
+                                 albumArtist: albumArtist,
+                                 discNumber: discNumber, trackNumber: trackNumber)
+    }
+
+    /// Number component of a positional (disc/track) metadata item,
+    /// mirroring the GAP B parse order: string value first ("n" or
+    /// "n/total"), binary iTunes atom payload second. Unparseable
+    /// values are skipped, never guessed.
+    static func positionalNumberOf(_ item: AVMetadataItem) async -> Int? {
+        if let position = (try? await item.load(.stringValue))
+            .flatMap(LocalImportEngine.parsePositionalTag) {
+            return position.number
+        }
+        if let data = try? await item.load(.dataValue),
+           let position = LocalImportEngine.parsePositionalAtom(data) {
+            return position.number
+        }
+        return nil
     }
 }
 
