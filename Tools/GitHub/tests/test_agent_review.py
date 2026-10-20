@@ -1,6 +1,7 @@
 import argparse
 import copy
 import importlib.util
+import io
 import subprocess
 from pathlib import Path
 import unittest
@@ -60,6 +61,10 @@ class FakeGitHub:
 
 class ReviewGateTests(unittest.TestCase):
     def setUp(self):
+        for stream in ("stdout", "stderr"):
+            output = patch(f"sys.{stream}", new_callable=io.StringIO)
+            output.start()
+            self.addCleanup(output.stop)
         self.api = FakeGitHub()
         self.args = argparse.Namespace(
             pr=6, reviewed_head=HEAD, reviewed_base=BASE, result="success",

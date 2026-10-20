@@ -72,3 +72,22 @@ enforces that identity itself. Server enforcement will need the supported plan
 and a protected verification check or trusted App that enforces the same identity
 and SHA contract. Keep the intended policy: CI plus exact-commit agent review,
 without mandatory human or code-owner approval. No server rules are weakened.
+
+## Acceptance evidence
+
+Validation on 2026-10-20, candidate `e56d84d407d721163a76e02db4d1bb7262faceb4`:
+
+| Check | Status | Evidence |
+| --- | --- | --- |
+| Focused safety tests | PASS | 18 local unittest cases; missing/stale/failed statuses, publisher/checkout guards, pagination, races, CLI availability, and network errors. |
+| Hosted tests | PASS | [Run 39518305756](https://github.com/raelldottin/tunory/actions/runs/39518305756): 155 core tests and 18 CLI tests passed. |
+| Missing live review | PASS | `python3 -B Tools/GitHub/agent_review.py check 6` exited 1 with `BLOCKED: Missing Agent review status on the current head` before publication. |
+| Review publication | PASS | A completed agent review was recorded through `record` and read back as status ID `56843745674`, context `Agent review`, state `success`, creator `raelldottin`, with the exact head/base comparison URL. This is the agent's attestation, not an independent review service. |
+| Pending live CI | PASS | After recording review and before CI completed, `check 6` exited 1 with `BLOCKED: Latest Core tests is not completed successfully`. |
+| Combined live check | PASS | After hosted CI completed, `check 6` exited 0 and reported the exact candidate SHA and base `0ddd5d4ea59e58cfedc334e8073d81b214ae80c3`. |
+| Server enforcement | BLOCKED | Protection reads for `main` and `dev` return HTTP 403 due to the private repository plan. No rule change or merge performed. |
+
+The agent reviewed the CLI's read/write scope, exact-SHA checks, publisher
+validation, race/error handling, test coverage, workflow permissions, and the
+complete task diff. Publishing this evidence changes the head and requires a
+fresh review attestation and passing CI before the new revision passes `check`.
