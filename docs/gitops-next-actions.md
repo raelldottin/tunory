@@ -8,7 +8,8 @@ device alarms, or estimate effort from task history.
 
 Research snapshot: 2026-10-20, `origin/main` at `0ddd5d4`. The existing stacked
 PRs and local work-in-progress commit are separate work. Recheck this inventory
-after those branches merge.
+after those branches merge. This table preserves the initial audit; the first
+CI implementation and hosted evidence below supersede the workflow gap.
 
 | Observation | Status | Evidence and boundary |
 | --- | --- | --- |
@@ -20,10 +21,10 @@ after those branches merge.
 | Toolchain | PASS | Apple Swift 6.4, Xcode 27.1; the core package explicitly uses Swift 5 language mode. |
 | Branch inventory | PASS | GitHub has `main` and feature branches; `dev` does not exist. |
 | Server-enforced review policy | BLOCKED | Protection reads for both requested branch names returned HTTP 403: private repository plan restriction. |
-| Hosted CI execution | NOT ATTEMPTED | No workflow exists. Local test success is not hosted CI proof. |
+| Hosted CI execution at initial audit | NOT ATTEMPTED | No workflow existed. See the later hosted evidence below. |
 | Signed app, device, live MusicKit, release | NOT ATTEMPTED | Outside this documentation slice. |
 
-The missing check to implement first is **Core tests**. It reuses an executable
+The first missing check identified was **Core tests**. It reuses an executable
 suite already present on `main`, without signing or live Apple Music access.
 The initial clean compile reported existing Swift concurrency warnings in test
 code; this audit does not resolve them or change language mode.
@@ -38,7 +39,7 @@ and capture the selected review policy without claiming it is enforced.
 | --- | --- | --- | --- |
 | Audit Tunory CI | PASS | Use the inventory above when preparing the first workflow. | Actual tracked and hosted workflow inventories, plus one named missing check. |
 | Reuse the core validation checklist | PASS | Run the checklist below on the revision being changed. | Exact SHA, toolchain, command, exit status, test total, and failures recorded. |
-| Add the first CI check | NOT ATTEMPTED | Validate `.github/workflows/core-tests.yml` locally, then run it on a PR and prove failure propagation on a temporary test PR. | A real GitHub run on a known SHA passes; a deliberately failing test produces a failed check. Capture the actual check name before requiring it. |
+| Add the first CI check | PASS | Review PR #6 for integration; select the trusted agent-review publisher before implementing the next gate. | `Core tests` passed all 155 tests on `890de43`; the same workflow failed with exit 1 on the intentional test in `cb72356`. Runs are linked below. |
 | Add exact-commit agent review | NOT ATTEMPTED | Select the trusted review publisher and its status/check identity before implementing `Agent review`. | Fresh passing review on current PR head; stale, absent, pending, and failed reviews all block. A new push invalidates the old result. |
 | Enforce the chosen branch policy | BLOCKED | Resolve the GitHub plan prerequisite, then verify server rules and apply the policy below after both checks exist. | Read-back of effective rules for both branches and a disposable PR proving blocked and allowed cases. |
 | Establish `dev` | NOT ATTEMPTED | After branch gates are available, create `dev` from the agreed reviewed integration commit and apply the same policy. | Branch SHA and effective rules independently read back. Do not enable an unprotected integration path while enforcement is blocked. |
@@ -66,6 +67,24 @@ documented correction before claiming success.
 
 This slice does not create `dev`, implement the agent-review publisher, configure
 required checks, change branch protections, or add deployment/signing workflows.
+
+### Hosted acceptance evidence
+
+| Criterion | Status | Evidence |
+| --- | --- | --- |
+| Workflow syntax | PASS | `actionlint .github/workflows/core-tests.yml` exited 0. |
+| Local behavior preserved | PASS | Existing suite: 155 tests, zero failures; no product or existing test code changed. |
+| Hosted positive case | PASS | [Run 39516987338](https://github.com/raelldottin/tunory/actions/runs/39516987338), PR head `890de4383241d70dbe7fdb881731c89298fac74d`: 155 tests, zero failures. |
+| Hosted negative case | PASS | [Run 39517064977](https://github.com/raelldottin/tunory/actions/runs/39517064977), temporary PR head `cb72356276311ab93e489fa16155ba932ff16f1e`: 156 tests, one intentional failure, command exit 1, check conclusion `failure`. |
+| Check identity | PASS | Check name `Core tests`, publisher `github-actions`; API read-back associated each result with its expected PR head SHA. Standard PR checkout tests the merge snapshot. This is CI evidence, not an agent review of the source head. |
+| Proof cleanup | PASS | Temporary PR #7 closed without merging; its proof-owned remote/local branch and worktree removed. The intentional test is absent from the implementation branch. |
+
+Both hosted cases used Swift 6.1.2 / Xcode 16.4 on `macos-15`. The deliberate
+failure came from `CIFailurePropagationProofTests.testIntentionalFailureReachesCI`
+with `XCTFail("Intentional CI failure-propagation proof; never merge this branch.")`.
+The command was the workflow's unchanged `swift test` invocation. This proves
+test failures propagate to the hosted check; it does not prove a branch rule
+rejects merging, because server enforcement remains blocked.
 
 ## Reusable core validation checklist
 
