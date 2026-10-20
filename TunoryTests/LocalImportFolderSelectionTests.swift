@@ -36,7 +36,13 @@ final class LocalImportFolderSelectionTests: XCTestCase {
             let path = url.standardizedFileURL.path
             let scoped = grantedPaths.contains(path)
             lock.lock(); defer { lock.unlock() }
-            events.append(("begin", path))
+            // Record only SUCCESSFUL begins as "begin" — the
+            // balanced invariant is one end per true begin
+            // (SecurityScopedAccess.swift contract). A URL carrying
+            // no scope (begin -> false) has nothing to release;
+            // recording it as "begin-denied" keeps it observable for
+            // order assertions without breaking balance.
+            events.append((scoped ? "begin" : "begin-denied", path))
             return scoped
         }
 
@@ -52,7 +58,7 @@ final class LocalImportFolderSelectionTests: XCTestCase {
             for (op, path) in events {
                 if op == "begin" {
                     outstanding[path, default: 0] += 1
-                } else {
+                } else if op == "end" {
                     outstanding[path, default: 0] -= 1
                     XCTAssertGreaterThanOrEqual(outstanding[path]!, 0,
                                                  "end without matching begin for \(path)",
@@ -256,5 +262,36 @@ final class LocalImportFolderSelectionTests: XCTestCase {
                        "reset must drop the stale destination grant")
         access.assertBalanced()
         XCTAssertEqual(model.step, .select)
+    }
+
+    /// C3/C6: select(folders:) claims every panel-issued URL BEFORE
+    /// the `.isDirectoryKey` probe — including a URL the probe drops.
+    /// The observable order proxy: the panel batch [folder, file,
+    /// folder] yields a `begin` for the dropped file URL too, so
+    /// claiming cannot have been conditioned on probe survivors (a
+    /// probe-then-claim order would only claim what the filter kept).
+    /// Balanced release proves every claim was returned. The dropped
+    /// URL still must not become a folder selection.
+    func testSelectFoldersClaimsBeforeDirectoryProbe() async throws {
+        let fileURL = albumA.appendingPathComponent("01 Track.wav")
+        let access = RecordingSecurityScopedAccess(
+            granted: [albumA, albumB, fileURL, outputDirectory])
+        let model = makeModel(access: access)
+        model.select(folders: [albumA, fileURL, albumB])
+
+        // Claim-before-probe: the whole panel batch was claimed,
+        // including the URL the probe dropped.
+        XCTAssertGreaterThanOrEqual(access.beginCount(for: albumA.standardizedFileURL.path), 1,
+                                    "select(folders:) must claim panel folder URLs")
+        XCTAssertGreaterThanOrEqual(access.beginCount(for: albumB.standardizedFileURL.path), 1,
+                                    "select(folders:) must claim panel folder URLs")
+        XCTAssertGreaterThanOrEqual(access.beginCount(for: fileURL.standardizedFileURL.path), 1,
+                                    "select(folders:) must claim every panel URL before the isDirectory probe — including URLs the probe drops")
+        access.assertBalanced()
+
+        // Selection semantics unchanged: the non-folder was dropped
+        // from the selection (still 2 folders, not 3 entries).
+        XCTAssertEqual(model.selectedCount, 2,
+                       "the claimed-but-dropped file URL must not count as a folder selection")
     }
 }

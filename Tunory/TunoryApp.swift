@@ -578,7 +578,12 @@ enum CLI {
     // verb parses arguments, prints the engine's plan/outcomes, and derives
     // the exit code. It never re-implements a financial/media decision and
     // never touches the Apple Music library.
-    private static func runLocalImport(args: [String]) async -> Int32 {
+    // `journalDirectory` is a test seam ONLY: production callers omit
+    // it and the journal resolves through the canonical container home
+    // (C2, D5 — the user-picked output directory receives only
+    // converted audio; journal records live in the app container,
+    // shared with the GUI through LocalImportJournal.defaultDirectory()).
+    static func runLocalImport(args: [String], journalDirectory: URL? = nil) async -> Int32 {
         // args[0] verb; args[1] output dir; then flags and at least one input.
         guard args.count >= 3 else {
             fputs("local-import <output-dir> [--profile aac256|alac] [--duplicates keep|skip] <file-or-dir>...\n", stderr)
@@ -641,7 +646,8 @@ enum CLI {
             }
         }
 
-        let journal = LocalImportJournal(directory: outputDirectory)
+        let journal = LocalImportJournal(directory: journalDirectory
+                                            ?? LocalImportJournal.defaultDirectory())
         let journalRecords = (try? journal.load())?.records ?? []
 
         var plans: [LocalImportPlan] = []

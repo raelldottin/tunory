@@ -115,9 +115,7 @@ final class LocalImportViewModel: ObservableObject {
         self.musicEngine = musicEngine
             ?? MusicImportEngine(scripting: MusicAppScripting())
         self.journalDirectory = journalDirectory
-            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-                .map { $0.appendingPathComponent("Tunory", isDirectory: true) }
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+            ?? LocalImportJournal.defaultDirectory()
         self.musicJournalDirectory = musicJournalDirectory
             ?? MusicImportJournal.defaultDirectory()
         self.securityScopedAccess = securityScopedAccess
@@ -164,6 +162,17 @@ final class LocalImportViewModel: ObservableObject {
     /// second decision path. The same folder handed twice counts once.
     func select(folders urls: [URL]) {
         reset()
+        // Claim every panel-issued URL before ANY access — including
+        // the `.isDirectoryKey` metadata read in the filter below
+        // (design C3/I5: claims cover metadata reads, not just file
+        // bodies; the pre-fix code read `.isDirectoryKey` unclaimed).
+        // The panel already guarantees directories (`canChooseFiles =
+        // false`); the filter stays as defense-in-depth and now runs
+        // under claim. Claims attach to the panel-issued URLs, never
+        // rebuilt copies (I6), and release on every exit path.
+        let claims = SecurityScopedClaims(claiming: securityScopedAccess)
+        defer { claims.release() }
+        for url in urls { claims.claim(url) }
         let directories = urls.filter {
             (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
         }

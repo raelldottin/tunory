@@ -110,6 +110,20 @@ public struct LocalImportJournal: Sendable {
         self.directory = directory
     }
 
+    /// Canonical on-disk home for the journal: Application Support /
+    /// Tunory (the app container's home under the sandbox). GUI and
+    /// CLI both resolve their journal through here so conversion
+    /// evidence lives in exactly one place and user-picked
+    /// destinations receive only converted audio (design D5; C1).
+    /// Mirrors MusicImportJournal.defaultDirectory()'s fallback
+    /// shape: temporaryDirectory only as a last resort.
+    public static func defaultDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory,
+                                            in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("Tunory", isDirectory: true)
+    }
+
     public var fileURL: URL { directory.appendingPathComponent(Self.fileName) }
 
     /// Load all records; empty when absent or unreadable (fail-visible:
