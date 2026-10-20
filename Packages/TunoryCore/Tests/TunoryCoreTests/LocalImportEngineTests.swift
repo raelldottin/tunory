@@ -461,6 +461,131 @@ final class LocalImportEngineTests: XCTestCase {
         }
     }
 
+    // MARK: - Phase 11 t_72d1c24a: multi-root nested FLAC selection
+
+    /// The four-album selection shape in one canonical proof (card
+    /// t_72d1c24a): MULTIPLE selected album folders — exactly what the
+    /// GUI folder picker hands `select(folders:)` → `planBatches` — each
+    /// containing NESTED disc subfolders (CD1/CD2), holding real FLAC
+    /// with the full metadata set (album title, album artist, track
+    /// artist, song title, disc number, track number) plus embedded
+    /// PICTURE artwork. Recursive discovery must find every file
+    /// through both roots, relative paths must preserve album + disc
+    /// structure, conversion must create the nested destination
+    /// layout and carry ALL six axes + artwork onto the outputs, and
+    /// the original FLAC files must stay byte-identical.
+    func testMultiRootNestedFLACDiscoveryPreservesAllMetadata() async throws {
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+
+        // Fixture descriptor: one row per FLAC track under a selected root.
+        struct NestedTrack {
+            let rootName: String
+            let dir: URL
+            let name: String
+            let title: String
+            let track: Int
+            let disc: Int
+            let album: String
+            let band: String
+            var relativePath: String { rootName + "/" + dir.lastPathComponent + "/" + name }
+        }
+
+        // Two selected album folders, each with nested disc subfolders:
+        // a flat walk would find none of these files.
+        let alpha = work.appendingPathComponent("AlbumAlpha", isDirectory: true)
+        let beta = work.appendingPathComponent("AlbumBeta", isDirectory: true)
+        let alphaCD1 = alpha.appendingPathComponent("CD1", isDirectory: true)
+        let alphaCD2 = alpha.appendingPathComponent("CD2", isDirectory: true)
+        let betaCD1 = beta.appendingPathComponent("CD1", isDirectory: true)
+        for dir in [alphaCD1, alphaCD2, betaCD1] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+
+        let png = try Self.makeTinyPNG(in: work)
+        let tracks: [NestedTrack] = [
+            NestedTrack(rootName: "AlbumAlpha", dir: alphaCD1, name: "01 Open Tone.flac",
+                        title: "Open Tone", track: 1, disc: 1, album: "Alpha Album", band: "Alpha Band"),
+            NestedTrack(rootName: "AlbumAlpha", dir: alphaCD1, name: "02 Second Tone.flac",
+                        title: "Second Tone", track: 2, disc: 1, album: "Alpha Album", band: "Alpha Band"),
+            NestedTrack(rootName: "AlbumAlpha", dir: alphaCD2, name: "01 Late Tone.flac",
+                        title: "Late Tone", track: 1, disc: 2, album: "Alpha Album", band: "Alpha Band"),
+            NestedTrack(rootName: "AlbumBeta", dir: betaCD1, name: "01 Beta Tone.flac",
+                        title: "Beta Tone", track: 1, disc: 1, album: "Beta Album", band: "Beta Band"),
+        ]
+        var sourceHashes: [String: String?] = [:]
+        for t in tracks {
+            let out = t.dir.appendingPathComponent(t.name)
+            try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                    "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                                    "-i", png.path,
+                                    "-map", "0:a", "-map", "1:v",
+                                    "-c:a", "flac", "-c:v", "png",
+                                    "-disposition:v", "attached_pic",
+                                    "-metadata", "title=\(t.title)",
+                                    "-metadata", "artist=Track Artist \(t.track)",
+                                    "-metadata", "album=\(t.album)",
+                                    "-metadata", "ALBUMARTIST=\(t.band)",
+                                    "-metadata", "DISCNUMBER=\(t.disc)",
+                                    "-metadata", "TRACKNUMBER=\(t.track)",
+                                    "-f", "flac", out.path])
+            sourceHashes[t.name] = LocalImportEngine.sha256Hex(fileURL: out)
+        }
+
+        let out = work.appendingPathComponent("out")
+        let engine = LocalImportEngine()
+        let journal = LocalImportJournal(directory: out.appendingPathComponent(".tunory"))
+        let plan = await engine.planBatches(sourceRoots: [alpha, beta],
+                                            outputRoot: out,
+                                            profile: .aac256, journalRecords: [])
+
+        // Recursive discovery through both selected roots: all four
+        // tracks found, every relative path carrying album + disc structure.
+        XCTAssertEqual(plan.entries.count, 4,
+                       "recursive discovery must find every FLAC under both selected folders")
+        XCTAssertEqual(plan.entries.map(\.relativePath).sorted(),
+                       tracks.map(\.relativePath).sorted(),
+                       "multi-root planning must preserve album + nested disc structure in every path")
+        for entry in plan.entries {
+            XCTAssertEqual(entry.decision, .convert, "valid FLAC must plan as convert")
+        }
+
+        for entry in plan.entries {
+            let outcome = await engine.convert(entry: entry, profile: .aac256, journal: journal)
+            XCTAssertEqual(outcome.status, .converted, outcome.detail ?? "")
+        }
+
+        // Per-file: nested destination created, six metadata axes +
+        // artwork carried, original untouched.
+        for t in tracks {
+            let dest = out.appendingPathComponent(t.relativePath)
+                .deletingPathExtension().appendingPathExtension("m4a")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: dest.path),
+                          "conversion must create the nested destination: \(dest.path)")
+
+            let metadata = try await Self.commonMetadata(of: dest)
+            XCTAssertEqual(metadata["title"], t.title, "song title must survive")
+            XCTAssertEqual(metadata["artist"], "Track Artist \(t.track)", "track artist must survive")
+            XCTAssertEqual(metadata["album"], t.album, "album title must survive")
+
+            let dump = try await Self.identifierDump(of: dest)
+            XCTAssertEqual(dump["itsk/aART"], t.band, "album artist must survive")
+            let trkn = try await Self.positionalAtom(of: dest, identifier: "itsk/trkn")
+            XCTAssertEqual(trkn?.number, t.track, "track number must survive")
+            let disk = try await Self.positionalAtom(of: dest, identifier: "itsk/disk")
+            XCTAssertEqual(disk?.number, t.disc, "disc number must survive")
+
+            let source = t.dir.appendingPathComponent(t.name)
+            let pictures = try LocalImportEngine.flacPictures(in: source)
+            XCTAssertEqual(pictures.count, 1, "fixture must embed exactly one PICTURE block")
+            let artwork = try await Self.artworkData(of: dest)
+            XCTAssertEqual(artwork, pictures.first?.data,
+                           "embedded FLAC artwork must survive conversion byte-identical")
+
+            XCTAssertEqual(sourceHashes[t.name], LocalImportEngine.sha256Hex(fileURL: source),
+                           "original FLAC must never be modified")
+        }
+    }
+
     // MARK: - Native conversion (D1 acceptance: in-process, no external binary)
 
     func testConvertFLACToM4AReferenceProfile() async throws {

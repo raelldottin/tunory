@@ -235,6 +235,50 @@ final class LocalImportFolderSelectionTests: XCTestCase {
             atPath: outputDirectory.appendingPathComponent("AlbumB/01 Track.m4a").path))
     }
 
+    /// Recursive discovery through the GUI folder-selection path (card
+    /// t_72d1c24a): selecting ONE parent folder whose audio lives in
+    /// nested disc subfolders (CD1/CD2) must surface every nested file
+    /// as a row — relative paths carrying the disc structure — and
+    /// convert into the matching nested destination layout. A flat
+    /// walk would find nothing.
+    func testFolderSelectionRecursesIntoSubfolders() async throws {
+        let albumC = work.appendingPathComponent("AlbumC", isDirectory: true)
+        let cd1 = albumC.appendingPathComponent("CD1", isDirectory: true)
+        let cd2 = albumC.appendingPathComponent("CD2", isDirectory: true)
+        try FileManager.default.createDirectory(at: cd1, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: cd2, withIntermediateDirectories: true)
+        try makeWAV(at: cd1.appendingPathComponent("01 Tone.wav"), frequency: 440)
+        try makeWAV(at: cd2.appendingPathComponent("01 Tone.wav"), frequency: 880)
+
+        let access = RecordingSecurityScopedAccess(granted: [albumC, outputDirectory])
+        let model = makeModel(access: access)
+        model.select(folders: [albumC])
+        XCTAssertEqual(model.selectedCount, 1)
+        await model.analyze(outputDirectory: outputDirectory)
+        access.assertBalanced()
+
+        XCTAssertEqual(model.rows.count, 2,
+                       "a single selected parent folder must recursively discover nested subfolder files")
+        XCTAssertEqual(Set(model.rows.map(\.relativePath)),
+                       ["CD1/01 Tone.wav", "CD2/01 Tone.wav"],
+                       "nested rows must carry the disc-folder structure in their relative paths")
+        for row in model.rows {
+            XCTAssertEqual(row.decision, .convert,
+                           "valid WAVs in nested folders must classify as convert from content")
+        }
+
+        await model.convertSelected()
+        let summary = model.resultsSummary
+        XCTAssertEqual(summary.converted, 2)
+        XCTAssertEqual(summary.failed, 0)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: outputDirectory.appendingPathComponent("CD1/01 Tone.m4a").path),
+                      "conversion must create the nested destination layout")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: outputDirectory.appendingPathComponent("CD2/01 Tone.m4a").path),
+                      "conversion must create the nested destination layout")
+    }
+
     /// The same folder handed twice (panel quirk) selects once.
     func testDuplicateFolderSelectionCountsOnce() async throws {
         let access = RecordingSecurityScopedAccess(granted: [albumA, outputDirectory])
