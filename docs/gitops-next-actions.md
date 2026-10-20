@@ -40,7 +40,7 @@ and capture the selected review policy without claiming it is enforced.
 | Audit Tunory CI | PASS | Use the inventory above when preparing the first workflow. | Actual tracked and hosted workflow inventories, plus one named missing check. |
 | Reuse the core validation checklist | PASS | Run the checklist below on the revision being changed. | Exact SHA, toolchain, command, exit status, test total, and failures recorded. |
 | Add the first CI check | PASS | Review PR #6 for integration; select the trusted agent-review publisher before implementing the next gate. | `Core tests` passed all 155 tests on `890de43`; the same workflow failed with exit 1 on the intentional test in `cb72356`. Runs are linked below. |
-| Add exact-commit agent review | NOT ATTEMPTED | Select the trusted review publisher and its status/check identity before implementing `Agent review`. | Fresh passing review on current PR head; stale, absent, pending, and failed reviews all block. A new push invalidates the old result. |
+| Add exact-commit agent review | NOT ATTEMPTED | Validate the [gh/git review helper](agent-review-cli.md), then review and attest the exact PR head using the existing `raelldottin` CLI identity. | Fresh passing review on current PR head; stale, absent, pending, failed, and unexpectedly published results all block. A new push or changed base invalidates the old result. |
 | Enforce the chosen branch policy | BLOCKED | Resolve the GitHub plan prerequisite, then verify server rules and apply the policy below after both checks exist. | Read-back of effective rules for both branches and a disposable PR proving blocked and allowed cases. |
 | Establish `dev` | NOT ATTEMPTED | After branch gates are available, create `dev` from the agreed reviewed integration commit and apply the same policy. | Branch SHA and effective rules independently read back. Do not enable an unprotected integration path while enforcement is blocked. |
 | Define deployment scope | NOT ATTEMPTED | In a separate focused task, record supported destinations, signing, artifacts, approvals, and device evidence before pipeline implementation. | A reviewed release contract and its validation plan. |
@@ -67,6 +67,11 @@ documented correction before claiming success.
 
 This slice does not create `dev`, implement the agent-review publisher, configure
 required checks, change branch protections, or add deployment/signing workflows.
+
+The subsequent agent-review CLI slice is described in
+[Agent review through gh and git](agent-review-cli.md). The owner selected the
+existing CLI tools for publication; no external review service is required for
+this attestation path. Server enforcement remains a separate blocked task.
 
 ### Hosted acceptance evidence
 
