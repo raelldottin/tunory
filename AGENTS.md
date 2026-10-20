@@ -392,6 +392,14 @@ git branch -vv
 
 ### Tests
 
+From the repository root, run the deterministic host-side core suite with an isolated scratch directory:
+
+```bash
+swift test --package-path Packages/TunoryCore --scratch-path /tmp/tunory-core-tests
+```
+
+Use a task-owned scratch path when another run may be active. This command is verified for the existing package; [CI audit and checklist](docs/ci-audit-and-checklist.md) records its source, toolchain and result. Core tests do not establish app UI, MusicKit authorization, live library writes, signing or release readiness.
+
 If dedicated test targets or Swift packages exist for the changed behavior, run the narrowest affected tests first, then broader tests before handoff when justified.
 
 Do not invent a validation command that the repository does not support. If a Makefile, script, or CI workflow becomes authoritative later, update this file to point agents at it.
