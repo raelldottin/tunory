@@ -38,7 +38,7 @@ and capture the selected review policy without claiming it is enforced.
 | --- | --- | --- | --- |
 | Audit Tunory CI | PASS | Use the inventory above when preparing the first workflow. | Actual tracked and hosted workflow inventories, plus one named missing check. |
 | Reuse the core validation checklist | PASS | Run the checklist below on the revision being changed. | Exact SHA, toolchain, command, exit status, test total, and failures recorded. |
-| Add the first CI check | NOT ATTEMPTED | Add a PR workflow for `Core tests` on `main` and, when created, `dev`, using a macOS runner with a compatible Swift toolchain. | A real GitHub run on a known SHA passes; a deliberately failing test produces a failed check. Capture the actual check name before requiring it. |
+| Add the first CI check | NOT ATTEMPTED | Validate `.github/workflows/core-tests.yml` locally, then run it on a PR and prove failure propagation on a temporary test PR. | A real GitHub run on a known SHA passes; a deliberately failing test produces a failed check. Capture the actual check name before requiring it. |
 | Add exact-commit agent review | NOT ATTEMPTED | Select the trusted review publisher and its status/check identity before implementing `Agent review`. | Fresh passing review on current PR head; stale, absent, pending, and failed reviews all block. A new push invalidates the old result. |
 | Enforce the chosen branch policy | BLOCKED | Resolve the GitHub plan prerequisite, then verify server rules and apply the policy below after both checks exist. | Read-back of effective rules for both branches and a disposable PR proving blocked and allowed cases. |
 | Establish `dev` | NOT ATTEMPTED | After branch gates are available, create `dev` from the agreed reviewed integration commit and apply the same policy. | Branch SHA and effective rules independently read back. Do not enable an unprotected integration path while enforcement is blocked. |
@@ -47,6 +47,25 @@ and capture the selected review policy without claiming it is enforced.
 These are checklist tasks, not claims that personal task records, Hermes tasks,
 or GitHub issues were edited. No matching GitOps task was found in the inspected
 Tunory Hermes board, and GitHub had no open issues at audit time.
+
+## First CI implementation slice
+
+The new `Core CI` workflow runs the existing package suite as the `Core tests`
+job on PRs targeting `main` or `dev`, and on pushes to those branches. Manual
+dispatch is available after the workflow reaches the default branch. It uses
+`macos-15` with the installed Xcode 16.4 toolchain, read-only repository access,
+an immutable checkout action reference, and a task-owned runner scratch path.
+Superseded runs are canceled; a failed test command fails the job.
+
+Acceptance: `actionlint` passes, the local suite still passes, a hosted PR run
+passes at a recorded revision, and a temporary PR with an intentionally failing
+test produces a failed `Core tests` check. Remove only the proof-owned resources
+after recording that result. Do not weaken tests or change product code to clear
+the hosted job. Hosted toolchain incompatibilities require diagnosis and a
+documented correction before claiming success.
+
+This slice does not create `dev`, implement the agent-review publisher, configure
+required checks, change branch protections, or add deployment/signing workflows.
 
 ## Reusable core validation checklist
 
