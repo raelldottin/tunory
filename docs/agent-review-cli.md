@@ -76,13 +76,14 @@ python3 -B -m unittest discover -s Tools/GitHub/tests -v
 These tests use fake API data and stub Git commands; they publish no statuses.
 The existing `Core tests` hosted job also runs them.
 
-The private repository's current plan returns HTTP 403 for branch protection.
-Consequently this CLI check cannot enforce merging on GitHub. GitHub's native
-commit-status rule also does not pin a personal-account status creator; the CLI
-enforces that identity itself. Server enforcement will need the supported plan
-and a protected verification check or trusted App that enforces the same identity
-and SHA contract. Keep the intended policy: CI plus exact-commit agent review,
-without mandatory human or code-owner approval. No server rules are weakened.
+The initial private-repository plan returned HTTP 403 for branch protection.
+The repository was subsequently observed public, and the selected native status
+rules are now active for both branches; see [native review policy](native-review-policy.md).
+GitHub's native status rule does not pin a personal-account creator or validate
+job-log provenance, so the CLI enforces those additional conditions. Making all
+of them automatic server checks would require a protected verifier or trusted
+App. The selected policy remains CI plus exact-commit agent review without
+mandatory human or code-owner approval. No unrelated server rules were weakened.
 
 ## Historical acceptance before the provenance review
 
@@ -132,8 +133,9 @@ The workflow adds one checkout marker and no dependency or artifact upload.
 
 Acceptance requires a real completed PR job with the marker matching the current
 merge commit, plus a fresh exact-head review. Existing pre-marker jobs must not
-be accepted as replacement proof. Server enforcement remains separately blocked
-by the repository plan.
+be accepted as replacement proof. The plan blocker in this historical acceptance
+was later resolved by the externally observed visibility change; the
+[native policy](native-review-policy.md) records the subsequent enforcement.
 
 The false-acceptance and stale-base cases were verified with deterministic API
 fixtures, not a live bypass. The corrected positive path was verified against

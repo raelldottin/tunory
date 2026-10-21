@@ -40,9 +40,9 @@ and capture the selected review policy without claiming it is enforced.
 | Audit Tunory CI | PASS | Use the inventory above when preparing the first workflow. | Actual tracked and hosted workflow inventories, plus one named missing check. |
 | Reuse the core validation checklist | PASS | Run the checklist below on the revision being changed. | Exact SHA, toolchain, command, exit status, test total, and failures recorded. |
 | Add the first CI check | PASS | Use the combined CLI check when evaluating PR #6 for integration. | `Core tests` passed all 155 tests on `890de43`; the same workflow failed with exit 1 on the intentional test in `cb72356`. The job also runs the subsequent CLI safety suite. |
-| Add exact-commit agent review | PASS | Re-review and attest each new head with the [corrected helper](agent-review-cli.md), then run the combined check before an authorized merge. | The P1 correction passed 29 safety tests, hosted CI, live run/job/merge-snapshot verification, and fresh review/read-back on `951e1c0`. Manual runs cannot replace failed PR CI. Server enforcement remains separately blocked. |
-| Enforce the chosen branch policy | BLOCKED | Resolve the GitHub plan prerequisite, then verify server rules and apply the policy below after both checks exist. | Read-back of effective rules for both branches and a disposable PR proving blocked and allowed cases. |
-| Establish `dev` | NOT ATTEMPTED | After branch gates are available, create `dev` from the agreed reviewed integration commit and apply the same policy. | Branch SHA and effective rules independently read back. Do not enable an unprotected integration path while enforcement is blocked. |
+| Add exact-commit agent review | PASS | Re-review and attest each new head with the [corrected helper](agent-review-cli.md), then run the combined check before an authorized merge. | The P1 correction passed 29 safety tests, hosted CI, and live run/job/merge-snapshot verification. Native contexts are now required; stronger publisher/provenance checks remain in the CLI. |
+| Enforce the chosen branch policy | PASS | Maintain and read back [ruleset 25528120](native-review-policy.md); keep using the stronger CLI before authorized merges. | Both effective rule targets verified; disposable PR #8 demonstrated missing-review and pending-CI blocking, then `CLEAN` with both passing and zero human reviews. |
+| Establish `dev` | PASS | Use the protected branch for subsequent PR-based integration. | Created at reviewed, CI-passing `b12869d8b2e7150dc99dc55f462fdfa91ae7d8a7` after effective rules were verified for the name. |
 | Define deployment scope | NOT ATTEMPTED | In a separate focused task, record supported destinations, signing, artifacts, approvals, and device evidence before pipeline implementation. | A reviewed release contract and its validation plan. |
 
 These are checklist tasks, not claims that personal task records, Hermes tasks,
@@ -65,13 +65,15 @@ after recording that result. Do not weaken tests or change product code to clear
 the hosted job. Hosted toolchain incompatibilities require diagnosis and a
 documented correction before claiming success.
 
-This slice does not create `dev`, implement the agent-review publisher, configure
-required checks, change branch protections, or add deployment/signing workflows.
+The initial CI-only slice did not create `dev`, implement the review publisher,
+configure required checks, or change branch rules. No slice adds deployment or
+signing workflows.
 
 The subsequent agent-review CLI slice is described in
 [Agent review through gh and git](agent-review-cli.md). The owner selected the
 existing CLI tools for publication; no external review service is required for
-this attestation path. Server enforcement remains a separate blocked task.
+this attestation path. The subsequent [native policy](native-review-policy.md)
+records required-context enforcement and the additional CLI trust boundary.
 
 ### Hosted acceptance evidence
 
@@ -122,7 +124,9 @@ changed. No signed build or runtime claim follows from these package tests.
 ## Selected review policy for `main` and `dev`
 
 Owner choice: **agent-review gate plus CI, with no mandatory human or code-owner
-approval**. This is the intended policy, not the current enforced configuration.
+approval**. Native required contexts are now enforced by
+[ruleset 25528120](native-review-policy.md). The CLI's stronger identity and
+provenance checks remain part of the pre-merge procedure.
 
 - Require pull requests and passing CI, including `Core tests` once implemented.
   Preserve any existing required checks and unrelated protections discovered at
@@ -139,7 +143,7 @@ approval**. This is the intended policy, not the current enforced configuration.
 - Verify both branches reject merges missing either required check and accept a
   PR only when the exact current head has passed review and applicable CI.
 
-The live prerequisite check was:
+The initial private-repository prerequisite check on 2026-10-20 was:
 
 ```bash
 gh api repos/raelldottin/tunory/branches/main/protection
@@ -152,6 +156,8 @@ Both exited 1 with HTTP 403 and:
 Upgrade to GitHub Pro or make this repository public to enable this feature.
 ```
 
-Do not change repository visibility to clear this blocker. A local hook or
-documented convention cannot substitute for server enforcement. No protection
-settings or branch visibility were changed by this slice.
+Do not change repository visibility to clear such a blocker. A local hook or
+documented convention cannot substitute for native enforcement. The initial
+documentation/CI slice changed no protection or visibility settings. After the
+repository was externally observed public on 2026-10-21, this task applied the
+native ruleset and created protected `dev`; it did not change visibility.

@@ -408,6 +408,11 @@ Use [the GitOps checklist](docs/gitops-next-actions.md) for the CI inventory,
 bounded next actions, review policy, and evidence requirements. Local verification
 does not establish a passing GitHub Actions run.
 
+Before an authorized merge to `main` or `dev`, run
+`python3 -B Tools/GitHub/agent_review.py check <PR-number>` on the current PR.
+Native required status contexts do not replace its publisher and CI-provenance
+checks; see [the native review policy](docs/native-review-policy.md).
+
 If dedicated test targets or Swift packages exist for the changed behavior, run the narrowest affected tests first, then broader tests before handoff when justified.
 
 Do not invent a validation command that the repository does not support. If a Makefile, script, or CI workflow becomes authoritative later, update this file to point agents at it.
