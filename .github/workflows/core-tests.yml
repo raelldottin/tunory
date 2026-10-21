@@ -29,6 +29,7 @@ jobs:
       - name: Record toolchain
         run: |
           git rev-parse HEAD
+          printf 'TUNORY_CI_MERGE_SHA=%s\n' "$(git rev-parse HEAD)"
           swift --version
           xcodebuild -version
       - name: Run core tests

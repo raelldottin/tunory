@@ -14,12 +14,14 @@ review = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(review)
 HEAD = "a" * 40
 BASE = "b" * 40
+MERGE = "d" * 40
 
 
 class FakeGitHub:
     def __init__(self):
         self.pr = {
             "state": "open",
+            "merge_commit_sha": MERGE,
             "head": {"sha": HEAD, "repo": {"full_name": review.REPO}},
             "base": {"sha": BASE, "ref": "main", "repo": {"full_name": review.REPO}},
         }
@@ -32,7 +34,22 @@ class FakeGitHub:
             "id": 1, "name": "Core tests", "status": "completed",
             "conclusion": "success", "head_sha": HEAD,
             "app": {"id": review.CI_APP_ID},
+            "check_suite": {"id": 1000},
+            "details_url": f"https://github.com/{review.REPO}/actions/runs/10/job/100",
         }]
+        self.runs = {10: {
+            "id": 10, "path": ".github/workflows/core-tests.yml",
+            "event": "pull_request", "head_sha": HEAD, "check_suite_id": 1000,
+            "pull_requests": [{"number": 6}], "repository": {"full_name": review.REPO},
+            "status": "completed", "conclusion": "success", "run_attempt": 1,
+        }}
+        self.jobs = {100: {
+            "id": 100, "run_id": 10, "run_attempt": 1,
+            "name": "Core tests", "status": "completed", "conclusion": "success",
+            "check_run_url": f"https://api.github.com/repos/{review.REPO}/check-runs/1",
+        }}
+        self.logs = {100: f"2026-10-20T23:00:00Z TUNORY_CI_MERGE_SHA={MERGE}\n"}
+        self.merge_commits = {MERGE: {"parents": [{"sha": BASE}, {"sha": HEAD}]}}
         self.login = review.PUBLISHER
         self.posts = []
         self.read_count = 0
@@ -41,6 +58,12 @@ class FakeGitHub:
     def read(self, path):
         if path == "user":
             return {"login": self.login}
+        if "/actions/runs/" in path:
+            return copy.deepcopy(self.runs[int(path.rsplit("/", 1)[1])])
+        if "/actions/jobs/" in path:
+            return copy.deepcopy(self.jobs[int(path.rsplit("/", 1)[1])])
+        if "/git/commits/" in path:
+            return copy.deepcopy(self.merge_commits[path.rsplit("/", 1)[1]])
         self.read_count += 1
         pr = copy.deepcopy(self.pr)
         if self.change_at is not None and self.read_count >= self.change_at:
@@ -57,6 +80,20 @@ class FakeGitHub:
         status = dict(payload, id=2, creator={"login": self.login})
         self.statuses.append(status)
         return status
+
+    def text(self, path):
+        return self.logs[int(path.split("/jobs/", 1)[1].split("/", 1)[0])]
+
+    def add_dispatch(self, conclusion="success"):
+        self.checks.append(dict(
+            self.checks[0], id=2, conclusion=conclusion,
+            check_suite={"id": 2000},
+            details_url=f"https://github.com/{review.REPO}/actions/runs/20/job/200",
+        ))
+        self.runs[20] = dict(
+            self.runs[10], id=20, check_suite_id=2000, event="workflow_dispatch",
+            conclusion=conclusion, pull_requests=[],
+        )
 
 
 class ReviewGateTests(unittest.TestCase):
@@ -200,6 +237,89 @@ class ReviewGateTests(unittest.TestCase):
                 with self.assertRaises(review.Blocked):
                     review.record(self.api, self.args)
                 self.assertEqual(self.api.posts, [])
+
+    def test_dispatch_success_cannot_mask_failed_pr_run(self):
+        self.api.checks[0]["conclusion"] = "failure"
+        self.api.runs[10]["conclusion"] = "failure"
+        self.api.jobs[100]["conclusion"] = "failure"
+        self.api.add_dispatch()
+        with self.assertRaises(review.Blocked):
+            self.check()
+
+    def test_new_base_requires_ci_for_the_new_merge_snapshot(self):
+        new_base, new_merge = "c" * 40, "e" * 40
+        self.api.pr["base"]["sha"] = new_base
+        self.api.pr["merge_commit_sha"] = new_merge
+        self.api.statuses[0]["target_url"] = review.evidence_url(HEAD, new_base)
+        self.api.merge_commits[new_merge] = {"parents": [{"sha": new_base}, {"sha": HEAD}]}
+        with self.assertRaises(review.Blocked):
+            self.check()
+
+    def test_unrelated_dispatch_failure_does_not_replace_valid_pr_ci(self):
+        self.api.add_dispatch(conclusion="failure")
+        self.check()
+
+    def test_wrong_workflow_or_pr_cannot_satisfy_ci(self):
+        for change in ({"path": ".github/workflows/other.yml"},
+                       {"pull_requests": [{"number": 99}]}):
+            with self.subTest(change=change), self.assertRaises(review.Blocked):
+                self.api = FakeGitHub()
+                self.api.runs[10].update(change)
+                self.check()
+
+    def test_run_identity_must_match_the_check(self):
+        for change in ({"id": 99}, {"head_sha": "c" * 40},
+                       {"check_suite_id": 99}, {"repository": {"full_name": "other/repo"}}):
+            with self.subTest(change=change), self.assertRaises(review.Blocked):
+                self.api = FakeGitHub()
+                self.api.runs[10].update(change)
+                self.check()
+
+    def test_job_must_match_the_check_and_attempt(self):
+        for change in ({"run_id": 99}, {"run_attempt": 2}, {"check_run_url": "other"},
+                       {"name": "Other job"}, {"conclusion": "failure"}):
+            with self.subTest(change=change), self.assertRaises(review.Blocked):
+                self.api = FakeGitHub()
+                self.api.jobs[100].update(change)
+                self.check()
+
+    def test_unfinished_workflow_cannot_use_an_old_successful_job(self):
+        self.api.runs[10].update(status="in_progress", conclusion=None, run_attempt=2)
+        with self.assertRaises(review.Blocked):
+            self.check()
+
+    def test_missing_stale_or_duplicate_snapshot_markers_block(self):
+        for logs in ("", f"TUNORY_CI_MERGE_SHA={'c' * 40}\n", self.api.logs[100] * 2):
+            with self.subTest(logs=logs), self.assertRaises(review.Blocked):
+                self.api.logs[100] = logs
+                self.check()
+
+    def test_unavailable_or_stale_merge_commit_blocks(self):
+        for change in ("missing", "parents"):
+            with self.subTest(change=change), self.assertRaises(review.Blocked):
+                self.api = FakeGitHub()
+                if change == "missing":
+                    self.api.pr["merge_commit_sha"] = None
+                else:
+                    self.api.merge_commits[MERGE]["parents"][0]["sha"] = "c" * 40
+                self.check()
+
+    def test_logs_must_be_available(self):
+        with patch.object(self.api, "text", side_effect=review.Blocked("HTTP 410")):
+            with self.assertRaisesRegex(review.Blocked, "HTTP 410"):
+                self.check()
+
+    def test_merge_ref_change_during_check_blocks(self):
+        original = self.api.read
+
+        def read(path):
+            result = original(path)
+            if path.endswith("/pulls/6") and self.api.read_count == 2:
+                result["merge_commit_sha"] = "e" * 40
+            return result
+
+        with patch.object(self.api, "read", side_effect=read), self.assertRaises(review.Blocked):
+            self.check()
 
     def test_closed_foreign_and_other_target_prs_block(self):
         for change in ("closed", "foreign", "target"):

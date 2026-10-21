@@ -15,8 +15,18 @@ recording a result and report blocking findings as `failure`.
 
 `check` requires the latest `Agent review` status on the current PR head to be
 successful, published by the configured account, and linked to the exact current
-head/base comparison. It also requires the latest `Core tests` check to be
-successful on that head and published by GitHub Actions (App ID 15368).
+head/base comparison. It also requires the latest applicable `Core tests` check
+from `.github/workflows/core-tests.yml`, published by GitHub Actions (App ID
+15368), for a `pull_request` run associated with this PR and source head.
+The selected check must match its workflow run, job, and run attempt; both the
+job and workflow must have completed successfully.
+
+The job records its actual checkout as `TUNORY_CI_MERGE_SHA` before tests run.
+The helper requires exactly one marker in that job's log, matching GitHub's
+current PR merge commit, whose parents must be the current base and head. It
+checks that the PR snapshot is unchanged after verification. Dispatch runs and
+other workflows cannot replace the relevant PR run, even if they publish the
+same job name on the same source SHA.
 
 Acceptance: deterministic tests must cover missing, pending, failed, stale, and
 unexpectedly published results; newer failures must override older success;
@@ -54,7 +64,8 @@ merges a PR or alters branch rules. `check` reports a status snapshot; draft
 state, conflicts, other future required checks, and changes after the snapshot
 remain separate merge conditions. Re-run it immediately before any authorized
 merge, and honor GitHub's effective requirements when server protection becomes
-available.
+available. GitHub job logs must still be available; missing/expired logs block
+verification. Run fresh PR CI for the current merge snapshot when required.
 
 ## Tests and enforcement boundary
 
@@ -73,7 +84,7 @@ and a protected verification check or trusted App that enforces the same identit
 and SHA contract. Keep the intended policy: CI plus exact-commit agent review,
 without mandatory human or code-owner approval. No server rules are weakened.
 
-## Acceptance evidence
+## Historical acceptance before the provenance review
 
 Validation on 2026-10-20, candidate `e56d84d407d721163a76e02db4d1bb7262faceb4`:
 
@@ -91,3 +102,33 @@ The agent reviewed the CLI's read/write scope, exact-SHA checks, publisher
 validation, race/error handling, test coverage, workflow permissions, and the
 complete task diff. Publishing this evidence changes the head and requires a
 fresh review attestation and passing CI before the new revision passes `check`.
+
+## P1 provenance correction
+
+Review of `0dfcbd9` found that a newer successful manual run could mask a failed
+PR merge run. The existing gate checked only job name, source SHA, publisher,
+and success. A deterministic reproduction returned PASS despite failed PR CI,
+so the agent review status on that revision was replaced with `failure`.
+
+Research also showed that workflow-run `pull_requests` metadata is dynamic:
+old runs `39516987338` and `39518305756` reported PR #6's newer head while their
+own `head_sha` retained their original revision. Do not use nested PR head/base
+metadata as evidence of what a historical job checked out. The correction uses
+run/job linkage plus the immutable checkout marker in the completed job's log.
+ANSI log text is captured for parsing and never rendered by the helper.
+
+The preservation contract remains the same: existing core tests, read-only CI
+permissions, explicit review attestation, and no automatic merge or rule change.
+The workflow adds one checkout marker and no dependency or artifact upload.
+
+| Pre-publication check | Status | Evidence |
+| --- | --- | --- |
+| Regression exposes the defect | PASS | Before the fix, the manual-success and changed-base cases both failed with `Blocked not raised`; 20 tests ran, two failed. |
+| Corrected safety suite | PASS | 29 tests passed, including those regressions and run/job/attempt identity, snapshot/log, and concurrency cases. |
+| Workflow lint | PASS | `actionlint .github/workflows/core-tests.yml` exited 0. |
+| Hosted corrected revision | NOT ATTEMPTED | Must pass a fresh PR run, then publish a completed review on that exact head and run the combined check. Final hosted acceptance is recorded in PR #6. |
+
+Acceptance requires a real completed PR job with the marker matching the current
+merge commit, plus a fresh exact-head review. Existing pre-marker jobs must not
+be accepted as replacement proof. Server enforcement remains separately blocked
+by the repository plan.
