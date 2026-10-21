@@ -1,5 +1,9 @@
 # macOS internal TestFlight: local archive evidence
 
+This record describes source `64c8d95` before the owner-selected
+[app icon](../app-icon.md) was integrated. Retain this evidence as historical;
+rebuild and verify a candidate containing the new icon before uploading it.
+
 ## Decision, scope, and acceptance plan
 
 On 2026-10-21 the owner selected **macOS internal TestFlight** as Tunory's first
