@@ -126,9 +126,16 @@ The workflow adds one checkout marker and no dependency or artifact upload.
 | Regression exposes the defect | PASS | Before the fix, the manual-success and changed-base cases both failed with `Blocked not raised`; 20 tests ran, two failed. |
 | Corrected safety suite | PASS | 29 tests passed, including those regressions and run/job/attempt identity, snapshot/log, and concurrency cases. |
 | Workflow lint | PASS | `actionlint .github/workflows/core-tests.yml` exited 0. |
-| Hosted corrected revision | NOT ATTEMPTED | Must pass a fresh PR run, then publish a completed review on that exact head and run the combined check. Final hosted acceptance is recorded in PR #6. |
+| Hosted corrected revision | PASS | [Run 39520452429](https://github.com/raelldottin/tunory/actions/runs/39520452429) on `951e1c0c9a93697067ff183f6e889b493faca8a2`: 155 core tests and 29 CLI tests passed. |
+| Live run/job/checkout verification | PASS | Job `118962747409` was linked to the expected PR run and attempt; its marker matched merge `e1bf2c7400505961d6a62347a6aa8c41db36311a`, with current base/head parents. |
+| Fresh review and combined check | PASS | After reviewing `951e1c0`, `record` published/read back success and `check 6` passed the corrected live provenance path. The earlier vulnerable revision remains marked failure. |
 
 Acceptance requires a real completed PR job with the marker matching the current
 merge commit, plus a fresh exact-head review. Existing pre-marker jobs must not
 be accepted as replacement proof. Server enforcement remains separately blocked
 by the repository plan.
+
+The false-acceptance and stale-base cases were verified with deterministic API
+fixtures, not a live bypass. The corrected positive path was verified against
+GitHub. Subsequent documentation commits require their own passing PR job and
+fresh review; PR #6 records final-head acceptance.
