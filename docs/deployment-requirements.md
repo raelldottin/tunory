@@ -7,26 +7,29 @@ release. Recheck the observations below on the actual release candidate.
 
 ## Scope and decisions
 
-Recommended first deployment: **macOS, internal TestFlight, then a separately
-authorized Mac App Store release**. This recommendation follows the existing
-macOS proof; it is not an owner-selected distribution policy. Platform and route
-selection remain open until the owner records them in the candidate's release
-record. Direct notarized macOS distribution and iPhone/iPad release have the
-additional requirements below.
+Owner-selected first deployment: **macOS internal TestFlight** (2026-10-21).
+The [local archive record](releases/macos-internal-testflight-2026-10-21.md)
+captures the selected route, candidate, successful development-signed archive,
+and successful local App Store Connect export. Automatic provisioning and the
+owner's local signing authorization resolved the first export's missing-profile
+failure. An internal tester group and an upload/build assignment remain
+unspecified. A Mac App Store
+release, external TestFlight, direct notarized macOS distribution, and iPhone/iPad
+deployment require separate selection and their applicable requirements below.
 
 | Decision | Requirement before dependent implementation |
 | --- | --- |
-| Platforms and compatibility | Select macOS first or macOS plus iPhone/iPad. Confirm minimum OS versions and Mac CPU architectures from an archive. Do not silently lower deployment targets to fit a runner. |
-| Distribution | Select TestFlight/App Store, direct notarized macOS, or both. Identify the App Store Connect app/platform records or the direct-download host and artifact format. |
+| Platforms and compatibility | macOS selected. The first local archive is arm64 with minimum macOS 27.0; confirm the intended compatibility promise before distribution. Do not silently lower deployment targets to fit a runner. |
+| Distribution | Internal TestFlight selected. Verify the App Store Connect macOS app record and identify the exact internal tester group before upload or assignment. Other routes remain unselected. |
 | Audience and release owner | Name the person authorized to approve the exact build, platform, tester group or public audience, and release action. Internal, external, and public-link beta distribution are distinct actions. |
 | Version and support | Select the marketing version, an acceptable unused build number, release notes, support contact, and privacy-policy location. Existing `1.0 (1)` settings are not proof that this version/build is available for upload. |
 | Automation | Select a runner with the required Xcode/SDK, credential provisioning method, artifact storage/access, retention period, and approval mechanism. Verify Apple's current upload requirements before choosing the toolchain. |
 
-This slice changes documentation only. It preserves app behavior, identity,
-signing, capabilities, library-write semantics, branch protections, and all
-unmerged product work. No signing-account mutation, archive, upload, tester
-assignment, tag, GitHub Release, or store submission is authorized by defining
-these requirements.
+This requirements contract preserves app behavior, identity, project signing
+settings, capabilities, library-write semantics, branch protections, and unmerged
+product work. Defining requirements does not by itself authorize signing-account
+mutation, archive, upload, tester assignment, tag, GitHub Release, or store
+submission. Subsequent preparation and its actual results are recorded separately.
 
 ## Verified repository baseline
 
@@ -178,14 +181,19 @@ Each release record must contain:
 
 | Slice | Concrete next action | Acceptance before progressing |
 | --- | --- | --- |
-| Choose the release | Record platform, route, audience, OS/CPU support, and owner decisions above. | A candidate-specific release record with those decisions filled in. |
-| Prove a local archive | Inspect current Apple/account prerequisites, then build and inspect one signed Release archive for the selected platform. | G2–G3 pass; G4–G5 have a bounded runtime/write plan. No upload is implied. |
+| Choose the release | macOS internal TestFlight is selected; finish compatibility, group, version/build and release-owner details in the release record. | A candidate-specific record with the remaining decisions filled in. |
+| Prove a local archive | [Release archive and local-only distribution export passed](releases/macos-internal-testflight-2026-10-21.md), including final package/app signature and identity inspection. Finish the bounded runtime/write plan before progressing. | G2–G3 evidence recorded; G4–G5 require actual signed-runtime and separately authorized live-write proof. No upload is implied. |
 | Prove signed runtime | Execute the approved platform smoke matrix and separately authorized test-owned writes. | G4–G6 pass with actual device/Mac and artifact identity. |
 | Add distribution automation | Implement one selected route with isolated signing, retained artifacts, explicit promotion, and failure handling. | Exercise its success/failure paths and G7–G8 with the exact authorized build/audience. |
 
-For this requirements slice: repository/configuration inspection and documentation
-review are `PASS`. Creating a new archive, signed runtime/device tests, live music
-writes, Apple account inspection, upload, notarization, and distribution are
-`NOT ATTEMPTED`. Release acceptance remains `BLOCKED` on the open decisions and
-candidate-specific G1–G8 evidence. Existing package CI and historical macOS proof
-do not close those gates.
+The original requirements slice reached repository/configuration inspection and
+documentation review. Subsequent [macOS internal TestFlight preparation](releases/macos-internal-testflight-2026-10-21.md)
+produced and inspected a development-signed Release archive (`PASS`). Its first
+local export failed for a missing provisioning profile (`FAIL`); a provisioning
+retry and owner-completed signing prompt produced a verified Apple Distribution
+app and signed installer package (`PASS`). Local export preparation is complete.
+Signed runtime/device tests, live music writes,
+independent Apple account/app-record inspection, upload, notarization, and
+distribution remain `NOT ATTEMPTED`. Overall release acceptance is still `BLOCKED`
+on candidate-specific G4–G8 evidence and remaining release decisions. Package CI
+and historical macOS proof do not close those gates.
