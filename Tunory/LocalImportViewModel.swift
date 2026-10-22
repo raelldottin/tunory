@@ -109,6 +109,11 @@ final class LocalImportViewModel: ObservableObject {
     @Published private(set) var musicJournalWarning: String?
     /// Index of the file being imported (progress indicator).
     @Published private(set) var importingIndex: Int?
+    /// Index of the source currently being surveyed against Music.app
+    /// (progress indicator for both read-only surveys: the
+    /// pre-conversion preflight and the post-conversion survey); nil
+    /// when idle (t_0dc47722).
+    @Published private(set) var surveyingIndex: Int?
 
     private let engine: LocalImportEngine
     private let musicEngine: MusicImportEngine
@@ -185,6 +190,17 @@ final class LocalImportViewModel: ObservableObject {
     var preflightReviewFiles: [URL] {
         zip(preflightFiles, preflightSurveys).compactMap { file, survey in
             survey?.matchKind == .needsReview ? file : nil
+        }
+    }
+
+    /// Preflight review evidence for the confirmation UI (t_0dc47722):
+    /// for each ambiguous preflight match, the library tracks the
+    /// survey found, in survey order. The engine decides; the view
+    /// renders it so the operator's explicit decision is informed.
+    var preflightReviewEvidence: [(file: URL, candidates: [MusicTrackRef])] {
+        zip(preflightFiles, preflightSurveys).compactMap { file, survey in
+            guard survey?.matchKind == .needsReview else { return nil }
+            return (file, survey?.candidates ?? [])
         }
     }
 
@@ -331,6 +347,7 @@ final class LocalImportViewModel: ObservableObject {
         generation &+= 1
         let revision = generation
         step = .musicPreflight
+        defer { surveyingIndex = nil }
         preflightEntries = entries
         let files = entries.map { URL(fileURLWithPath: $0.sourcePath) }
         preflightFiles = files
@@ -351,7 +368,8 @@ final class LocalImportViewModel: ObservableObject {
         // its own survey, or nil when that survey failed.
         var surveys: [MusicLibraryCandidate?] = []
         var failures: [String] = []
-        for file in files {
+        for (index, file) in files.enumerated() {
+            surveyingIndex = index
             guard let survey = await musicEngine.surveyFile(file: file) else {
                 surveys.append(nil)
                 failures.append(file.path)
@@ -481,6 +499,7 @@ final class LocalImportViewModel: ObservableObject {
         generation &+= 1
         let revision = generation
         step = .musicSurvey
+        defer { surveyingIndex = nil }
         musicImportFiles = candidates
         musicSurveys = []
         musicSurveyFailures = []
@@ -509,7 +528,8 @@ final class LocalImportViewModel: ObservableObject {
         // musicSurveyFailures and makes musicReviewRequired true.
         var surveys: [MusicLibraryCandidate?] = []
         var failures: [String] = []
-        for file in candidates {
+        for (index, file) in candidates.enumerated() {
+            surveyingIndex = index
             guard let survey = await musicEngine.surveyFile(file: file) else {
                 surveys.append(nil)
                 failures.append(file.path)
@@ -548,6 +568,18 @@ final class LocalImportViewModel: ObservableObject {
     var musicFilesNeedingReview: [URL] {
         zip(musicImportFiles, musicSurveys).compactMap { file, survey in
             survey?.matchKind == .needsReview ? file : nil
+        }
+    }
+
+    /// Review evidence for the confirmation UI (t_0dc47722): for each
+    /// ambiguous (needsReview) candidate, the library tracks the
+    /// survey matched, in candidate order. The engine decides; the
+    /// view renders this so the operator's explicit confirmation is
+    /// informed. Clean, failed and duplicate surveys carry no entries.
+    var musicReviewEvidence: [(file: URL, candidates: [MusicTrackRef])] {
+        zip(musicImportFiles, musicSurveys).compactMap { file, survey in
+            guard survey?.matchKind == .needsReview else { return nil }
+            return (file, survey?.candidates ?? [])
         }
     }
 
@@ -639,6 +671,7 @@ final class LocalImportViewModel: ObservableObject {
         musicOutcomes = []
         musicJournalWarning = nil
         importingIndex = nil
+        surveyingIndex = nil
         preflightFiles = []
         preflightSurveys = []
         preflightFailures = []
