@@ -76,7 +76,14 @@ final class LocalImportViewModel: ObservableObject {
     /// convert step actually produced (converted or passthrough).
     @Published private(set) var musicImportFiles: [URL] = []
     /// Survey classification per import candidate, from the engine.
-    @Published private(set) var musicSurveys: [MusicLibraryCandidate] = []
+    /// Position-aligned with `musicImportFiles`: element i is the survey
+    /// outcome for `musicImportFiles[i]`, or nil when that candidate's
+    /// survey FAILED (Music unreachable, script error, timeout). A nil
+    /// entry is fail-closed: the candidate is excluded from both
+    /// `musicImportReadyFiles` and `musicFilesNeedingReview` - never
+    /// re-paired with a neighbor's survey - and it surfaces in
+    /// `musicSurveyFailures` and `musicReviewRequired` (t_e6a35c8e).
+    @Published private(set) var musicSurveys: [MusicLibraryCandidate?] = []
     /// Files whose survey failed outright (Music busy, script error):
     /// fail-stop; never treated as "no candidates".
     @Published private(set) var musicSurveyFailures: [String] = []
@@ -348,10 +355,17 @@ final class LocalImportViewModel: ObservableObject {
             claims.claim(outputDirectory)
         }
 
-        var surveys: [MusicLibraryCandidate] = []
+        // Per-candidate pairing (t_e6a35c8e): every candidate occupies
+        // exactly one slot - its own survey, or nil when that survey
+        // failed. Successful surveys are never re-paired across a
+        // failure, and a failed candidate is excluded from both the
+        // ready list and the review list (fail closed) - it surfaces in
+        // musicSurveyFailures and makes musicReviewRequired true.
+        var surveys: [MusicLibraryCandidate?] = []
         var failures: [String] = []
         for file in candidates {
             guard let survey = await musicEngine.surveyFile(file: file) else {
+                surveys.append(nil)
                 failures.append(file.path)
                 continue
             }
@@ -366,25 +380,28 @@ final class LocalImportViewModel: ObservableObject {
 
     /// True when at least one surveyed file requires explicit review
     /// (metadata collision) or the survey failed for any file: the import
-    /// cannot proceed without explicit user action.
+    /// cannot proceed without explicit user action. A failed survey is
+    /// an uncertain state - it must never read as "no review needed".
     var musicReviewRequired: Bool {
-        musicSurveys.contains { $0.matchKind == .needsReview }
+        musicSurveys.contains { $0 == nil || $0?.matchKind == .needsReview }
     }
 
     /// Files classified as safe to import (no exact duplicate, no
-    /// metadata collision, no survey failure).
+    /// metadata collision, no survey failure). A failed survey (nil
+    /// entry) is excluded: an unsurveyed file is an uncertain state and
+    /// must never auto-import (fail closed).
     var musicImportReadyFiles: [URL] {
         zip(musicImportFiles, musicSurveys).compactMap { file, survey in
-            survey.matchKind == .noCandidate ? file : nil
+            survey?.matchKind == .noCandidate ? file : nil
         }
     }
 
     /// Files the user must explicitly resolve before import: metadata
-    /// collisions. Exact duplicates and survey failures never enter the
-    /// import list at all.
+    /// collisions. Exact duplicates, survey failures and undecodable
+    /// candidates never enter the import list at all.
     var musicFilesNeedingReview: [URL] {
         zip(musicImportFiles, musicSurveys).compactMap { file, survey in
-            survey.matchKind == .needsReview ? file : nil
+            survey?.matchKind == .needsReview ? file : nil
         }
     }
 
