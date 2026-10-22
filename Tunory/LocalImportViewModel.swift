@@ -17,6 +17,8 @@ final class LocalImportViewModel: ObservableObject {
         case select
         case analyzing
         case review
+        case musicPreflight
+        case musicPreflightReview
         case converting
         case results
         case musicSurvey
@@ -87,8 +89,22 @@ final class LocalImportViewModel: ObservableObject {
     /// Files whose survey failed outright (Music busy, script error):
     /// fail-stop; never treated as "no candidates".
     @Published private(set) var musicSurveyFailures: [String] = []
+    // MARK: - Music.app duplicate preflight state (before conversion)
+
+    /// Pre-conversion duplicate preflight: sources surveyed against the
+    /// live Music library BEFORE any conversion (card t_21d15d73). These
+    /// are the SELECTED source files, position-aligned with
+    /// `preflightSurveys` (one slot per selected source, nil on survey
+    /// failure — fail closed, never re-paired).
+    @Published private(set) var preflightFiles: [URL] = []
+    @Published private(set) var preflightSurveys: [MusicLibraryCandidate?] = []
+    @Published private(set) var preflightFailures: [String] = []
+    /// Snapshot of the plan entries the preflight surveyed; the conversion
+    /// set derives from this snapshot so later row edits cannot change it.
+    private var preflightEntries: [LocalImportPlanEntry] = []
     /// Per-file import outcomes, after the import run.
     @Published private(set) var musicOutcomes: [MusicImportOutcome] = []
+
     /// Warning from loading the Music import journal (unreadable etc.).
     @Published private(set) var musicJournalWarning: String?
     /// Index of the file being imported (progress indicator).
@@ -144,6 +160,47 @@ final class LocalImportViewModel: ObservableObject {
             guard row.decision == .convert || row.decision == .passthroughNative else { return nil }
             if row.requiresReview, reviewDecisions[row.id] != .include { return nil }
             return row.planEntry
+        }
+    }
+
+    // MARK: - Derived preflight state (all decisions from MusicImportEngine)
+
+    /// True when any preflight survey is ambiguous (needsReview): the
+    /// flow must stop for explicit user resolution before conversion —
+    /// ambiguous matches are never auto-resolved (owner rule).
+    var preflightReviewRequired: Bool {
+        preflightSurveys.contains { $0?.matchKind == .needsReview }
+    }
+
+    /// Sources missing from the Music library (noCandidate): the
+    /// conversion set. Deterministic, in preflight order.
+    var preflightReadyFiles: [URL] {
+        zip(preflightFiles, preflightSurveys).compactMap { file, survey in
+            survey?.matchKind == .noCandidate ? file : nil
+        }
+    }
+
+    /// Ambiguous preflight matches: converted only when the user has
+    /// explicitly resolved them (convertAfterPreflight(reviewResolved: true)).
+    var preflightReviewFiles: [URL] {
+        zip(preflightFiles, preflightSurveys).compactMap { file, survey in
+            survey?.matchKind == .needsReview ? file : nil
+        }
+    }
+
+    /// Sources already proven present in the Music library (exact bytes
+    /// or verified same-recording) or whose identity could not be proven
+    /// (undecodableCandidate): excluded from conversion entirely — they
+    /// are never converted just to be skipped at import.
+    var preflightExcludedFiles: [URL] {
+        zip(preflightFiles, preflightSurveys).compactMap { file, survey in
+            guard let match = survey?.matchKind else { return nil }
+            switch match {
+            case .exactDuplicate, .verifiedExisting, .undecodableCandidate:
+                return file
+            case .noCandidate, .needsReview:
+                return nil
+            }
         }
     }
 
@@ -258,11 +315,83 @@ final class LocalImportViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Convert
+    // MARK: - Music duplicate preflight (before conversion)
 
-    func convertSelected() async {
+    /// Read-only pre-conversion duplicate preflight (card t_21d15d73,
+    /// phase 11 req 2): survey every SELECTED SOURCE against live Music
+    /// library state BEFORE any conversion, so conversion only runs for
+    /// recordings missing from the library. No write is issued and no
+    /// journal record is written. A survey that fails outright (nil) is
+    /// fail-closed: that source is excluded from conversion and surfaces
+    /// in `preflightFailures` — never converted unsurveyed. Ambiguous
+    /// matches (needsReview) stop the flow for explicit user resolution.
+    func preflightMusicLibrary() async {
         let entries = selectedForProcessing
         guard !entries.isEmpty else { return }
+        generation &+= 1
+        let revision = generation
+        step = .musicPreflight
+        preflightEntries = entries
+        let files = entries.map { URL(fileURLWithPath: $0.sourcePath) }
+        preflightFiles = files
+        preflightSurveys = []
+        preflightFailures = []
+
+        // The survey re-reads every source (tags + content hash); claim
+        // every powerbox grant it touches for the whole preflight.
+        let claims = SecurityScopedClaims(claiming: securityScopedAccess)
+        defer { claims.release() }
+        for url in grantedFileURLs { claims.claim(url) }
+        if let outputDirectory = grantedOutputDirectory ?? outputDirectory {
+            claims.claim(outputDirectory)
+        }
+
+        // Per-candidate pairing (same invariant as the post-conversion
+        // survey, t_e6a35c8e): every source occupies exactly one slot —
+        // its own survey, or nil when that survey failed.
+        var surveys: [MusicLibraryCandidate?] = []
+        var failures: [String] = []
+        for file in files {
+            guard let survey = await musicEngine.surveyFile(file: file) else {
+                surveys.append(nil)
+                failures.append(file.path)
+                continue
+            }
+            guard revision == generation else { return }
+            surveys.append(survey)
+        }
+        guard revision == generation else { return }
+        preflightSurveys = surveys
+        preflightFailures = failures
+        step = .musicPreflightReview
+    }
+
+    /// Convert ONLY the preflight-approved sources: recordings missing
+    /// from the Music library, plus ambiguous ones when the user has
+    /// explicitly resolved them. Sources already in the library, survey
+    /// failures and — without resolution — ambiguous ones are NEVER
+    /// converted. Originals are never modified and every promoted output
+    /// is validated by the engine (decodable, matches profile, duration
+    /// within 1 s) before it counts as converted.
+    func convertAfterPreflight(reviewResolved: Bool) async {
+        // Deterministic conversion set, in preflight order: exactly the
+        // sources the duplicate preflight approved for import.
+        let entries = zip(preflightEntries, preflightSurveys).compactMap {
+            entry, survey -> LocalImportPlanEntry? in
+            guard let match = survey?.matchKind else { return nil }
+            switch match {
+            case .noCandidate: return entry
+            case .needsReview: return reviewResolved ? entry : nil
+            case .exactDuplicate, .verifiedExisting, .undecodableCandidate:
+                return nil
+            }
+        }
+        guard !entries.isEmpty else {
+            outcomes = []
+            convertingIndex = nil
+            step = .results
+            return
+        }
         generation &+= 1
         let revision = generation
         step = .converting
@@ -289,6 +418,23 @@ final class LocalImportViewModel: ObservableObject {
         }
         convertingIndex = nil
         step = .results
+    }
+
+    // MARK: - Convert
+
+    /// Conversion entry point: run the Music.app duplicate preflight
+    /// FIRST, then convert only the preflight-approved set (card
+    /// t_21d15d73: conversion happens only for tracks selected for
+    /// import after the duplicate preflight). When the preflight finds
+    /// ambiguous matches the flow stops at `.musicPreflightReview` and
+    /// conversion resumes via `convertAfterPreflight(reviewResolved:)`;
+    /// nothing is converted until the user resolves.
+    func convertSelected() async {
+        await preflightMusicLibrary()
+        if preflightReviewRequired {
+            return
+        }
+        await convertAfterPreflight(reviewResolved: false)
     }
 
     // MARK: - Results
@@ -493,6 +639,10 @@ final class LocalImportViewModel: ObservableObject {
         musicOutcomes = []
         musicJournalWarning = nil
         importingIndex = nil
+        preflightFiles = []
+        preflightSurveys = []
+        preflightFailures = []
+        preflightEntries = []
         step = .select
     }
 }

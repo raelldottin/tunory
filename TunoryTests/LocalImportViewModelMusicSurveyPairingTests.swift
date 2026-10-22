@@ -73,6 +73,55 @@ final class LocalImportViewModelMusicSurveyPairingTests: XCTestCase {
         }
     }
 
+    /// Sequenced scripting surface (t_21d15d73): the pre-conversion
+    /// duplicate preflight (card t_21d15d73) now surveys every SELECTED
+    /// SOURCE before conversion, so a single key-based stub can no
+    /// longer distinguish the preflight queries from the post-conversion
+    /// survey queries. This stub returns `preflight` results for the
+    /// first `preflight.count` searchLibrary calls and `post` results
+    /// for the remainder — the exact call order of surveyedModel().
+    private final class SequencedMusicScripting: MusicScripting, @unchecked Sendable {
+        private let lock = NSLock()
+        private let preflight: [[MusicTrackRef]?]
+        private let post: [[MusicTrackRef]?]
+        private var calls = 0
+        private var added: [URL] = []
+
+        init(preflight: [[MusicTrackRef]?], post: [[MusicTrackRef]?]) {
+            self.preflight = preflight
+            self.post = post
+        }
+
+        func musicVersion() async -> String? { "1.0-stub" }
+        func libraryTrackCount() async -> Int? { 0 }
+
+        func searchLibrary(query: String) async -> [MusicTrackRef]? {
+            lock.lock(); defer { lock.unlock() }
+            let idx = calls
+            calls += 1
+            if idx < preflight.count { return preflight[idx] }
+            let p = idx - preflight.count
+            if p < post.count { return post[p] }
+            return []
+        }
+
+        func track(withPersistentID id: String) async -> MusicTrackRef? {
+            MusicTrackRef(persistentID: id, name: nil,
+                          locationPath: nil, durationSeconds: nil)
+        }
+
+        func add(file: URL) async -> String? {
+            lock.lock(); defer { lock.unlock() }
+            added.append(file)
+            return "STUB-\(added.count)"
+        }
+
+        func addedFiles() -> [URL] {
+            lock.lock(); defer { lock.unlock() }
+            return added
+        }
+    }
+
     /// Permissive claim recorder: these tests prove survey pairing, not
     /// sandbox enforcement (that is LocalImportViewModelSecurityScopeTests'
     /// contract); every begin succeeds so claims never mask pairing
@@ -143,7 +192,7 @@ final class LocalImportViewModelMusicSurveyPairingTests: XCTestCase {
         try data.write(to: url)
     }
 
-    private func makeModel(scripting: StubSearchMusicScripting) -> LocalImportViewModel {
+    private func makeModel(scripting: SequencedMusicScripting) -> LocalImportViewModel {
         LocalImportViewModel(engine: LocalImportEngine(),
                              musicEngine: MusicImportEngine(scripting: scripting),
                              journalDirectory: journalDirectory,
@@ -152,7 +201,11 @@ final class LocalImportViewModelMusicSurveyPairingTests: XCTestCase {
     }
 
     /// Drive the flow to three converted import candidates, then survey.
-    private func surveyedModel(scripting: StubSearchMusicScripting) async -> LocalImportViewModel {
+    /// The pre-conversion duplicate preflight (t_21d15d73) runs inside
+    /// convertSelected() and must classify all three sources as
+    /// missing (noCandidate) for this fixture to reach conversion; the
+    /// post-conversion survey then exercises the canned `post` results.
+    private func surveyedModel(scripting: SequencedMusicScripting) async -> LocalImportViewModel {
         let model = makeModel(scripting: scripting)
         model.select(files: [sourceA, sourceB, sourceC])
         await model.analyze(outputDirectory: outputDirectory)
@@ -166,11 +219,10 @@ final class LocalImportViewModelMusicSurveyPairingTests: XCTestCase {
     // MARK: - Tests
 
     func testMidListSurveyFailureNeverShiftsPairingAndNeverAutoImports() async throws {
-        let scripting = StubSearchMusicScripting(searchResults: [
-            "tone-a": [],   // clean library -> ready
-            "tone-b": nil,  // survey FAILURE (Music busy / script error)
-            "tone-c": [],   // clean library -> ready
-        ])
+        let scripting = SequencedMusicScripting(
+            preflight: [[], [], []],          // all three sources missing -> all convert
+            post: [[], nil, []]                // converted candidates: clean, FAILURE, clean
+        )
         let model = await surveyedModel(scripting: scripting)
         XCTAssertEqual(model.step, .musicReview)
 
@@ -209,16 +261,14 @@ final class LocalImportViewModelMusicSurveyPairingTests: XCTestCase {
     }
 
     func testReviewPairingIsExactAndUnresolvedConflictsNeverAutoImport() async throws {
-        let scripting = StubSearchMusicScripting(searchResults: [
-            // tone-a collides with a library track by metadata whose
-            // file bytes differ -> needsReview.
-            "tone-a": [MusicTrackRef(persistentID: "LIB-A",
-                                     name: "tone-a",
-                                     locationPath: sourceA.path,
-                                     durationSeconds: 3.0)],
-            "tone-b": nil,  // survey FAILURE
-            "tone-c": [],   // clean -> ready
-        ])
+        let refA = MusicTrackRef(persistentID: "LIB-A",
+                                 name: "tone-a",
+                                 locationPath: sourceA.path,
+                                 durationSeconds: 3.0)
+        let scripting = SequencedMusicScripting(
+            preflight: [[], [], []],          // all three sources missing -> all convert
+            post: [[refA], nil, []]            // converted: needsReview, FAILURE, clean
+        )
         let model = await surveyedModel(scripting: scripting)
         XCTAssertEqual(model.step, .musicReview)
 

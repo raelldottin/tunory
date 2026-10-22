@@ -27,6 +27,8 @@ struct LocalImportView: View {
             case .select:      selectBody
             case .analyzing:  analyzingBody
             case .review:     reviewBody
+            case .musicPreflight:     musicPreflightBody
+            case .musicPreflightReview: musicPreflightReviewBody
             case .converting: convertingBody
             case .results:    resultsBody
             case .musicSurvey:   musicSurveyBody
@@ -265,6 +267,94 @@ struct LocalImportView: View {
                 Text("Surveying \((model.importingIndex ?? 0) + 1) of \(total)…")
             }
             .accessibilityIdentifier("local.musicSurveyProgress")
+        }
+    }
+
+    /// Preflight: read-only duplicate check against the Music library
+    /// BEFORE conversion. Nothing is written; nothing is converted yet.
+    private var musicPreflightBody: some View {
+        Group {
+            TunoryNotice(title: "Checking Music library…",
+                         message: "Tunory is comparing each selected recording against your Music library by content (SHA-256) before converting. Nothing is written and no conversion runs until this completes.",
+                         symbol: "magnifyingglass")
+            ProgressView("Surveying selected sources…")
+                .frame(maxWidth: .infinity, alignment: .center)
+                .accessibilityIdentifier("local.musicPreflightProgress")
+        }
+    }
+
+    /// Preflight review: present the duplicate classification and collect
+    /// explicit confirmation before any conversion. Ambiguous matches are
+    /// never auto-resolved; recordings already in the library are never
+    /// converted.
+    private var musicPreflightReviewBody: some View {
+        Group {
+            TunoryNotice(title: "Review before converting",
+                         message: "Each selected recording was compared against your Music library. Recordings already present are skipped; ambiguous matches need your explicit decision. Nothing is converted until you confirm.",
+                         symbol: "checklist")
+            if !model.preflightFailures.isEmpty {
+                GroupBox("Preflight failures (conversion blocked)") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(model.preflightFailures, id: \.self) { path in
+                            Text("✗ \\(path)").font(.caption)
+                        }
+                        Text("These recordings could not be surveyed. Converting without a survey could duplicate library tracks — they are excluded.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            GroupBox("Recordings already in your Music library (not converted)") {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(model.preflightExcludedFiles, id: \.path) { file in
+                        Text("⏭ \\((file.path as NSString).lastPathComponent)").font(.caption)
+                    }
+                    if model.preflightExcludedFiles.isEmpty {
+                        Text("None.").foregroundStyle(.secondary).font(.caption)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox("Recordings missing from your Music library (will convert)") {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(model.preflightReadyFiles, id: \.path) { file in
+                        Text("→ \\((file.path as NSString).lastPathComponent)")
+                    }
+                    if model.preflightReadyFiles.isEmpty {
+                        Text("No recordings are missing from the library.").foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if !model.preflightReviewFiles.isEmpty {
+                GroupBox("Ambiguous matches — explicit decision required") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(model.preflightReviewFiles, id: \.path) { file in
+                            Text("⚠ \\((file.path as NSString).lastPathComponent)")
+                        }
+                        Text("These match library tracks by metadata but not by content. Converting them may create duplicates — confirm below only if you want both versions.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            TunoryActions {
+                Button("Cancel") { model.reset() }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("local.preflightCancel")
+                if !model.preflightReadyFiles.isEmpty || !model.preflightReviewFiles.isEmpty {
+                    Button(model.preflightReviewFiles.isEmpty
+                           ? "Convert \\(model.preflightReadyFiles.count) recording(s)"
+                           : "Convert All (I reviewed the ambiguous matches)") {
+                        Task { await model.convertAfterPreflight(reviewResolved: model.preflightReviewFiles.isEmpty ? false : true) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("local.preflightConvert")
+                } else {
+                    Button("Continue") { model.reset() }
+                        .buttonStyle(.bordered)
+                }
+            }
         }
     }
 
