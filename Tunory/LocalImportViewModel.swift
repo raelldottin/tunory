@@ -17,6 +17,8 @@ final class LocalImportViewModel: ObservableObject {
         case select
         case analyzing
         case review
+        case musicPreflight
+        case musicPreflightReview
         case converting
         case results
         case musicSurvey
@@ -76,16 +78,42 @@ final class LocalImportViewModel: ObservableObject {
     /// convert step actually produced (converted or passthrough).
     @Published private(set) var musicImportFiles: [URL] = []
     /// Survey classification per import candidate, from the engine.
-    @Published private(set) var musicSurveys: [MusicLibraryCandidate] = []
+    /// Position-aligned with `musicImportFiles`: element i is the survey
+    /// outcome for `musicImportFiles[i]`, or nil when that candidate's
+    /// survey FAILED (Music unreachable, script error, timeout). A nil
+    /// entry is fail-closed: the candidate is excluded from both
+    /// `musicImportReadyFiles` and `musicFilesNeedingReview` - never
+    /// re-paired with a neighbor's survey - and it surfaces in
+    /// `musicSurveyFailures` and `musicReviewRequired` (t_e6a35c8e).
+    @Published private(set) var musicSurveys: [MusicLibraryCandidate?] = []
     /// Files whose survey failed outright (Music busy, script error):
     /// fail-stop; never treated as "no candidates".
     @Published private(set) var musicSurveyFailures: [String] = []
+    // MARK: - Music.app duplicate preflight state (before conversion)
+
+    /// Pre-conversion duplicate preflight: sources surveyed against the
+    /// live Music library BEFORE any conversion (card t_21d15d73). These
+    /// are the SELECTED source files, position-aligned with
+    /// `preflightSurveys` (one slot per selected source, nil on survey
+    /// failure — fail closed, never re-paired).
+    @Published private(set) var preflightFiles: [URL] = []
+    @Published private(set) var preflightSurveys: [MusicLibraryCandidate?] = []
+    @Published private(set) var preflightFailures: [String] = []
+    /// Snapshot of the plan entries the preflight surveyed; the conversion
+    /// set derives from this snapshot so later row edits cannot change it.
+    private var preflightEntries: [LocalImportPlanEntry] = []
     /// Per-file import outcomes, after the import run.
     @Published private(set) var musicOutcomes: [MusicImportOutcome] = []
+
     /// Warning from loading the Music import journal (unreadable etc.).
     @Published private(set) var musicJournalWarning: String?
     /// Index of the file being imported (progress indicator).
     @Published private(set) var importingIndex: Int?
+    /// Index of the source currently being surveyed against Music.app
+    /// (progress indicator for both read-only surveys: the
+    /// pre-conversion preflight and the post-conversion survey); nil
+    /// when idle (t_0dc47722).
+    @Published private(set) var surveyingIndex: Int?
 
     private let engine: LocalImportEngine
     private let musicEngine: MusicImportEngine
@@ -100,6 +128,9 @@ final class LocalImportViewModel: ObservableObject {
     private var grantedFileURLs: [URL] = []
     private var grantedOutputDirectory: URL?
     private var selectedFiles: [URL] = []
+    /// GAP A: folders selected via the GUI folder picker (empty when
+    /// the user picked individual files). Analyze branches on this.
+    private var selectedFolders: [URL] = []
     private var reviewDecisions: [Int: Row.ReviewDecision] = [:]
     private var generation = 0
 
@@ -112,9 +143,7 @@ final class LocalImportViewModel: ObservableObject {
         self.musicEngine = musicEngine
             ?? MusicImportEngine(scripting: MusicAppScripting())
         self.journalDirectory = journalDirectory
-            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-                .map { $0.appendingPathComponent("Tunory", isDirectory: true) }
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+            ?? LocalImportJournal.defaultDirectory()
         self.musicJournalDirectory = musicJournalDirectory
             ?? MusicImportJournal.defaultDirectory()
         self.securityScopedAccess = securityScopedAccess
@@ -139,6 +168,58 @@ final class LocalImportViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Derived preflight state (all decisions from MusicImportEngine)
+
+    /// True when any preflight survey is ambiguous (needsReview): the
+    /// flow must stop for explicit user resolution before conversion —
+    /// ambiguous matches are never auto-resolved (owner rule).
+    var preflightReviewRequired: Bool {
+        preflightSurveys.contains { $0?.matchKind == .needsReview }
+    }
+
+    /// Sources missing from the Music library (noCandidate): the
+    /// conversion set. Deterministic, in preflight order.
+    var preflightReadyFiles: [URL] {
+        zip(preflightFiles, preflightSurveys).compactMap { file, survey in
+            survey?.matchKind == .noCandidate ? file : nil
+        }
+    }
+
+    /// Ambiguous preflight matches: converted only when the user has
+    /// explicitly resolved them (convertAfterPreflight(reviewResolved: true)).
+    var preflightReviewFiles: [URL] {
+        zip(preflightFiles, preflightSurveys).compactMap { file, survey in
+            survey?.matchKind == .needsReview ? file : nil
+        }
+    }
+
+    /// Preflight review evidence for the confirmation UI (t_0dc47722):
+    /// for each ambiguous preflight match, the library tracks the
+    /// survey found, in survey order. The engine decides; the view
+    /// renders it so the operator's explicit decision is informed.
+    var preflightReviewEvidence: [(file: URL, candidates: [MusicTrackRef])] {
+        zip(preflightFiles, preflightSurveys).compactMap { file, survey in
+            guard survey?.matchKind == .needsReview else { return nil }
+            return (file, survey?.candidates ?? [])
+        }
+    }
+
+    /// Sources already proven present in the Music library (exact bytes
+    /// or verified same-recording) or whose identity could not be proven
+    /// (undecodableCandidate): excluded from conversion entirely — they
+    /// are never converted just to be skipped at import.
+    var preflightExcludedFiles: [URL] {
+        zip(preflightFiles, preflightSurveys).compactMap { file, survey in
+            guard let match = survey?.matchKind else { return nil }
+            switch match {
+            case .exactDuplicate, .verifiedExisting, .undecodableCandidate:
+                return file
+            case .noCandidate, .needsReview:
+                return nil
+            }
+        }
+    }
+
     // MARK: - Selection
 
     func select(files urls: [URL]) {
@@ -152,6 +233,42 @@ final class LocalImportViewModel: ObservableObject {
         selectedCount = urls.count
     }
 
+    /// GAP A (phase 11): GUI folder selection. Multi-select folders
+    /// from NSOpenPanel. Only directories count; the panel grants the
+    /// folder URL itself, so claims stay on these exact URLs (a rebuilt
+    /// file URL inside the folder is NOT the granted URL). Analyze
+    /// routes the folders to the same canonical `planBatches` planner —
+    /// folder selection is a new presentation of the SAME plan, never a
+    /// second decision path. The same folder handed twice counts once.
+    func select(folders urls: [URL]) {
+        reset()
+        // Claim every panel-issued URL before ANY access — including
+        // the `.isDirectoryKey` metadata read in the filter below
+        // (design C3/I5: claims cover metadata reads, not just file
+        // bodies; the pre-fix code read `.isDirectoryKey` unclaimed).
+        // The panel already guarantees directories (`canChooseFiles =
+        // false`); the filter stays as defense-in-depth and now runs
+        // under claim. Claims attach to the panel-issued URLs, never
+        // rebuilt copies (I6), and release on every exit path.
+        let claims = SecurityScopedClaims(claiming: securityScopedAccess)
+        defer { claims.release() }
+        for url in urls { claims.claim(url) }
+        let directories = urls.filter {
+            (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        }
+        guard !directories.isEmpty else { return }
+        var seen = Set<String>()
+        var unique: [URL] = []
+        for url in directories {
+            if seen.insert(url.standardizedFileURL.path).inserted {
+                unique.append(url)
+            }
+        }
+        grantedFileURLs = unique
+        selectedFolders = unique.sorted { $0.standardizedFileURL.path < $1.standardizedFileURL.path }
+        selectedCount = unique.count
+    }
+
     func setProfile(_ newProfile: ConversionProfile) {
         profile = newProfile
     }
@@ -159,7 +276,7 @@ final class LocalImportViewModel: ObservableObject {
     // MARK: - Analyze (all decisions from the engine)
 
     func analyze(outputDirectory: URL) async {
-        guard !selectedFiles.isEmpty else { return }
+        guard !selectedFiles.isEmpty || !selectedFolders.isEmpty else { return }
         generation &+= 1
         let revision = generation
         self.outputDirectory = outputDirectory
@@ -169,8 +286,8 @@ final class LocalImportViewModel: ObservableObject {
         reviewDecisions = [:]
 
         // Claim every powerbox grant this read touches (selected files
-        // + destination directory, whose contents the destination guard
-        // probes), and release on every exit path.
+        // or folders + destination directory, whose contents the
+        // destination guard probes), and release on every exit path.
         let claims = SecurityScopedClaims(claiming: securityScopedAccess)
         defer { claims.release() }
         for url in grantedFileURLs { claims.claim(url) }
@@ -180,10 +297,22 @@ final class LocalImportViewModel: ObservableObject {
         let (records, warning) = (try? journal.load()) ?? ([], nil)
         journalWarning = warning
 
-        let plan = await engine.planFiles(files: selectedFiles,
+        // One canonical planner for every selection mode: files go
+        // through planFiles; folders through planBatches (which the
+        // single-root batch walk also delegates to). Never a second
+        // decision path.
+        let plan: LocalImportPlan
+        if selectedFolders.isEmpty {
+            plan = await engine.planFiles(files: selectedFiles,
                                           outputDirectory: outputDirectory,
                                           profile: profile,
                                           journalRecords: records)
+        } else {
+            plan = await engine.planBatches(sourceRoots: selectedFolders,
+                                            outputRoot: outputDirectory,
+                                            profile: profile,
+                                            journalRecords: records)
+        }
         guard revision == generation else { return }
         rows = plan.entries.enumerated().map { index, entry in
             Row(id: index, planEntry: entry, reviewDecision: .notReviewed)
@@ -202,11 +331,85 @@ final class LocalImportViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Convert
+    // MARK: - Music duplicate preflight (before conversion)
 
-    func convertSelected() async {
+    /// Read-only pre-conversion duplicate preflight (card t_21d15d73,
+    /// phase 11 req 2): survey every SELECTED SOURCE against live Music
+    /// library state BEFORE any conversion, so conversion only runs for
+    /// recordings missing from the library. No write is issued and no
+    /// journal record is written. A survey that fails outright (nil) is
+    /// fail-closed: that source is excluded from conversion and surfaces
+    /// in `preflightFailures` — never converted unsurveyed. Ambiguous
+    /// matches (needsReview) stop the flow for explicit user resolution.
+    func preflightMusicLibrary() async {
         let entries = selectedForProcessing
         guard !entries.isEmpty else { return }
+        generation &+= 1
+        let revision = generation
+        step = .musicPreflight
+        defer { surveyingIndex = nil }
+        preflightEntries = entries
+        let files = entries.map { URL(fileURLWithPath: $0.sourcePath) }
+        preflightFiles = files
+        preflightSurveys = []
+        preflightFailures = []
+
+        // The survey re-reads every source (tags + content hash); claim
+        // every powerbox grant it touches for the whole preflight.
+        let claims = SecurityScopedClaims(claiming: securityScopedAccess)
+        defer { claims.release() }
+        for url in grantedFileURLs { claims.claim(url) }
+        if let outputDirectory = grantedOutputDirectory ?? outputDirectory {
+            claims.claim(outputDirectory)
+        }
+
+        // Per-candidate pairing (same invariant as the post-conversion
+        // survey, t_e6a35c8e): every source occupies exactly one slot —
+        // its own survey, or nil when that survey failed.
+        var surveys: [MusicLibraryCandidate?] = []
+        var failures: [String] = []
+        for (index, file) in files.enumerated() {
+            surveyingIndex = index
+            guard let survey = await musicEngine.surveyFile(file: file) else {
+                surveys.append(nil)
+                failures.append(file.path)
+                continue
+            }
+            guard revision == generation else { return }
+            surveys.append(survey)
+        }
+        guard revision == generation else { return }
+        preflightSurveys = surveys
+        preflightFailures = failures
+        step = .musicPreflightReview
+    }
+
+    /// Convert ONLY the preflight-approved sources: recordings missing
+    /// from the Music library, plus ambiguous ones when the user has
+    /// explicitly resolved them. Sources already in the library, survey
+    /// failures and — without resolution — ambiguous ones are NEVER
+    /// converted. Originals are never modified and every promoted output
+    /// is validated by the engine (decodable, matches profile, duration
+    /// within 1 s) before it counts as converted.
+    func convertAfterPreflight(reviewResolved: Bool) async {
+        // Deterministic conversion set, in preflight order: exactly the
+        // sources the duplicate preflight approved for import.
+        let entries = zip(preflightEntries, preflightSurveys).compactMap {
+            entry, survey -> LocalImportPlanEntry? in
+            guard let match = survey?.matchKind else { return nil }
+            switch match {
+            case .noCandidate: return entry
+            case .needsReview: return reviewResolved ? entry : nil
+            case .exactDuplicate, .verifiedExisting, .undecodableCandidate:
+                return nil
+            }
+        }
+        guard !entries.isEmpty else {
+            outcomes = []
+            convertingIndex = nil
+            step = .results
+            return
+        }
         generation &+= 1
         let revision = generation
         step = .converting
@@ -233,6 +436,23 @@ final class LocalImportViewModel: ObservableObject {
         }
         convertingIndex = nil
         step = .results
+    }
+
+    // MARK: - Convert
+
+    /// Conversion entry point: run the Music.app duplicate preflight
+    /// FIRST, then convert only the preflight-approved set (card
+    /// t_21d15d73: conversion happens only for tracks selected for
+    /// import after the duplicate preflight). When the preflight finds
+    /// ambiguous matches the flow stops at `.musicPreflightReview` and
+    /// conversion resumes via `convertAfterPreflight(reviewResolved:)`;
+    /// nothing is converted until the user resolves.
+    func convertSelected() async {
+        await preflightMusicLibrary()
+        if preflightReviewRequired {
+            return
+        }
+        await convertAfterPreflight(reviewResolved: false)
     }
 
     // MARK: - Results
@@ -279,6 +499,7 @@ final class LocalImportViewModel: ObservableObject {
         generation &+= 1
         let revision = generation
         step = .musicSurvey
+        defer { surveyingIndex = nil }
         musicImportFiles = candidates
         musicSurveys = []
         musicSurveyFailures = []
@@ -299,10 +520,18 @@ final class LocalImportViewModel: ObservableObject {
             claims.claim(outputDirectory)
         }
 
-        var surveys: [MusicLibraryCandidate] = []
+        // Per-candidate pairing (t_e6a35c8e): every candidate occupies
+        // exactly one slot - its own survey, or nil when that survey
+        // failed. Successful surveys are never re-paired across a
+        // failure, and a failed candidate is excluded from both the
+        // ready list and the review list (fail closed) - it surfaces in
+        // musicSurveyFailures and makes musicReviewRequired true.
+        var surveys: [MusicLibraryCandidate?] = []
         var failures: [String] = []
-        for file in candidates {
+        for (index, file) in candidates.enumerated() {
+            surveyingIndex = index
             guard let survey = await musicEngine.surveyFile(file: file) else {
+                surveys.append(nil)
                 failures.append(file.path)
                 continue
             }
@@ -317,25 +546,40 @@ final class LocalImportViewModel: ObservableObject {
 
     /// True when at least one surveyed file requires explicit review
     /// (metadata collision) or the survey failed for any file: the import
-    /// cannot proceed without explicit user action.
+    /// cannot proceed without explicit user action. A failed survey is
+    /// an uncertain state - it must never read as "no review needed".
     var musicReviewRequired: Bool {
-        musicSurveys.contains { $0.matchKind == .needsReview }
+        musicSurveys.contains { $0 == nil || $0?.matchKind == .needsReview }
     }
 
     /// Files classified as safe to import (no exact duplicate, no
-    /// metadata collision, no survey failure).
+    /// metadata collision, no survey failure). A failed survey (nil
+    /// entry) is excluded: an unsurveyed file is an uncertain state and
+    /// must never auto-import (fail closed).
     var musicImportReadyFiles: [URL] {
         zip(musicImportFiles, musicSurveys).compactMap { file, survey in
-            survey.matchKind == .noCandidate ? file : nil
+            survey?.matchKind == .noCandidate ? file : nil
         }
     }
 
     /// Files the user must explicitly resolve before import: metadata
-    /// collisions. Exact duplicates and survey failures never enter the
-    /// import list at all.
+    /// collisions. Exact duplicates, survey failures and undecodable
+    /// candidates never enter the import list at all.
     var musicFilesNeedingReview: [URL] {
         zip(musicImportFiles, musicSurveys).compactMap { file, survey in
-            survey.matchKind == .needsReview ? file : nil
+            survey?.matchKind == .needsReview ? file : nil
+        }
+    }
+
+    /// Review evidence for the confirmation UI (t_0dc47722): for each
+    /// ambiguous (needsReview) candidate, the library tracks the
+    /// survey matched, in candidate order. The engine decides; the
+    /// view renders this so the operator's explicit confirmation is
+    /// informed. Clean, failed and duplicate surveys carry no entries.
+    var musicReviewEvidence: [(file: URL, candidates: [MusicTrackRef])] {
+        zip(musicImportFiles, musicSurveys).compactMap { file, survey in
+            guard survey?.matchKind == .needsReview else { return nil }
+            return (file, survey?.candidates ?? [])
         }
     }
 
@@ -413,6 +657,7 @@ final class LocalImportViewModel: ObservableObject {
         grantedFileURLs = []
         grantedOutputDirectory = nil
         selectedFiles = []
+        selectedFolders = []
         selectedCount = 0
         rows = []
         reviewDecisions = [:]
@@ -426,6 +671,11 @@ final class LocalImportViewModel: ObservableObject {
         musicOutcomes = []
         musicJournalWarning = nil
         importingIndex = nil
+        surveyingIndex = nil
+        preflightFiles = []
+        preflightSurveys = []
+        preflightFailures = []
+        preflightEntries = []
         step = .select
     }
 }

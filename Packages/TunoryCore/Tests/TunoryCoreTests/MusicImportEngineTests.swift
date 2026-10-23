@@ -637,4 +637,365 @@ final class MusicImportEngineTests: XCTestCase {
         let reachable2 = await dead.isMusicReachable()
         XCTAssertFalse(reachable2)
     }
+
+    // MARK: - GAP C: cross-format duplicate preflight (phase 11, Req 2)
+    //
+    // A FLAC import candidate and an existing AAC of the SAME recording
+    // can never be byte-identical, so the SHA-256 funnel alone would
+    // route them to review every time. The classifier therefore also
+    // recognizes a metadata-verified same-recording match: all six
+    // axes (title, artist, album, album artist, disc, track) present on
+    // BOTH sides and exactly equal, and both durations present and
+    // within the ±2 s tolerance. Anything less keeps today's
+    // conservative behavior: review, never a silent skip or import.
+
+    private func makeCandidate(bytes: [UInt8] = [1, 2, 3, 4],
+                                name: String = "candidate.m4a") throws -> URL {
+        try makeFile(name: name, bytes: bytes)
+    }
+
+    /// Library twin carrying the full six-axis metadata.
+    private func makeTwin(id: String = "TW01",
+                          title: String? = "Song",
+                          artist: String? = "Artist",
+                          album: String? = "Album",
+                          albumArtist: String? = "Artist",
+                          disc: Int? = 1,
+                          track: Int? = 3,
+                          location: String,
+                          duration: Double? = 200.0) -> MusicTrackRef {
+        MusicTrackRef(persistentID: id, name: title, artist: artist, album: album,
+                      albumArtist: albumArtist, discNumber: disc, trackNumber: track,
+                      locationPath: location, durationSeconds: duration)
+    }
+
+    private func makeTags(title: String? = "Song",
+                          artist: String? = "Artist",
+                          album: String? = "Album",
+                          albumArtist: String? = "Artist",
+                          disc: Int? = 1,
+                          track: Int? = 3) -> AudioMetadataTags {
+        AudioMetadataTags(title: title, artist: artist, album: album,
+                          albumArtist: albumArtist, discNumber: disc,
+                          trackNumber: track)
+    }
+
+    func test_classify_verifiedExisting_allAxesEqualWithinDurationTolerance() throws {
+        let candidate = try makeCandidate()
+        let libraryFile = try makeFile(name: "library.aac", bytes: [9, 9, 9, 9])
+        let twin = makeTwin(location: libraryFile.path, duration: 201.5)
+        let hash = LocalImportEngine.sha256Hex(fileURL: candidate)!
+
+        let survey = MusicImportEngine.classify(filePath: candidate.path,
+                                                candidateHash: hash,
+                                                candidateTags: makeTags(),
+                                                candidateDurationSeconds: 200.0,
+                                                libraryTracks: [twin])
+
+        XCTAssertEqual(survey.matchKind, .verifiedExisting,
+                       "FLAC candidate vs AAC twin: six axes equal + durations within ±2 s must verify as the same recording")
+        XCTAssertEqual(survey.duplicate?.persistentID, "TW01",
+                       "the verified twin is carried as evidence for the review/skip UI")
+    }
+
+    func test_classify_verifiedExisting_atToleranceEdge() throws {
+        let candidate = try makeCandidate()
+        let libraryFile = try makeFile(name: "library.aac", bytes: [9, 9, 9, 9])
+        // |200.0 - 202.0| == 2.0 exactly: inside the tolerance (inclusive).
+        let twin = makeTwin(location: libraryFile.path, duration: 202.0)
+        let hash = LocalImportEngine.sha256Hex(fileURL: candidate)!
+
+        let survey = MusicImportEngine.classify(filePath: candidate.path,
+                                                candidateHash: hash,
+                                                candidateTags: makeTags(),
+                                                candidateDurationSeconds: 200.0,
+                                                libraryTracks: [twin])
+
+        XCTAssertEqual(survey.matchKind, .verifiedExisting)
+    }
+
+    func test_classify_remasterDifferentDuration_requiresReview() throws {
+        let candidate = try makeCandidate()
+        let libraryFile = try makeFile(name: "library.aac", bytes: [9, 9, 9, 9])
+        // Same metadata axes, but a 2003 remaster runs 11 s longer: a
+        // DIFFERENT recording - must never verify as the same one.
+        let twin = makeTwin(location: libraryFile.path, duration: 211.0)
+        let hash = LocalImportEngine.sha256Hex(fileURL: candidate)!
+
+        let survey = MusicImportEngine.classify(filePath: candidate.path,
+                                                candidateHash: hash,
+                                                candidateTags: makeTags(),
+                                                candidateDurationSeconds: 200.0,
+                                                libraryTracks: [twin])
+
+        XCTAssertEqual(survey.matchKind, .needsReview,
+                       "a remaster (same tags, different duration) is a different recording - review")
+    }
+
+    func test_classify_sameDurationDifferentAlbum_requiresReview() throws {
+        let candidate = try makeCandidate()
+        let libraryFile = try makeFile(name: "library.aac", bytes: [9, 9, 9, 9])
+        // Same song on a different album (e.g. greatest hits): not a duplicate.
+        let twin = makeTwin(album: "Greatest Hits", location: libraryFile.path)
+        let hash = LocalImportEngine.sha256Hex(fileURL: candidate)!
+
+        let survey = MusicImportEngine.classify(filePath: candidate.path,
+                                                candidateHash: hash,
+                                                candidateTags: makeTags(),
+                                                candidateDurationSeconds: 200.0,
+                                                libraryTracks: [twin])
+
+        XCTAssertEqual(survey.matchKind, .needsReview,
+                       "same recording on a different album is not a duplicate - review")
+    }
+
+    func test_classify_discTrackTransposition_requiresReview() throws {
+        let candidate = try makeCandidate()
+        let libraryFile = try makeFile(name: "library.aac", bytes: [9, 9, 9, 9])
+        // Track 3 disc 1 vs track 1 disc 3: both "present and equal" on
+        // four axes but transposed on two - a different track.
+        let twin = makeTwin(disc: 3, track: 1, location: libraryFile.path)
+        let hash = LocalImportEngine.sha256Hex(fileURL: candidate)!
+
+        let survey = MusicImportEngine.classify(filePath: candidate.path,
+                                                candidateHash: hash,
+                                                candidateTags: makeTags(disc: 1, track: 3),
+                                                candidateDurationSeconds: 200.0,
+                                                libraryTracks: [twin])
+
+        XCTAssertEqual(survey.matchKind, .needsReview,
+                       "disc/track transposition is a different track - review")
+    }
+
+    func test_classify_compilationAlbumArtistMismatch_requiresReview() throws {
+        let candidate = try makeCandidate()
+        let libraryFile = try makeFile(name: "library.aac", bytes: [9, 9, 9, 9])
+        // Compilation: same track artist, different album artist.
+        let twin = makeTwin(albumArtist: "Various Artists", location: libraryFile.path)
+        let hash = LocalImportEngine.sha256Hex(fileURL: candidate)!
+
+        let survey = MusicImportEngine.classify(filePath: candidate.path,
+                                                candidateHash: hash,
+                                                candidateTags: makeTags(albumArtist: "Artist"),
+                                                candidateDurationSeconds: 200.0,
+                                                libraryTracks: [twin])
+
+        XCTAssertEqual(survey.matchKind, .needsReview,
+                       "compilation album-artist mismatch is a different release - review")
+    }
+
+    func test_classify_missingAxisOnEitherSide_requiresReview() throws {
+        let candidate = try makeCandidate()
+        let libraryFile = try makeFile(name: "library.aac", bytes: [9, 9, 9, 9])
+        let hash = LocalImportEngine.sha256Hex(fileURL: candidate)!
+
+        // Library twin has no album artist: identity is not provable.
+        let twin = makeTwin(albumArtist: nil, location: libraryFile.path)
+        let surveyA = MusicImportEngine.classify(filePath: candidate.path,
+                                                 candidateHash: hash,
+                                                 candidateTags: makeTags(),
+                                                 candidateDurationSeconds: 200.0,
+                                                 libraryTracks: [twin])
+        XCTAssertEqual(surveyA.matchKind, .needsReview,
+                       "a missing axis on the library side cannot prove identity - review")
+
+        // Candidate has no track number: identity is not provable.
+        let twinB = makeTwin(location: libraryFile.path)
+        let surveyB = MusicImportEngine.classify(filePath: candidate.path,
+                                                 candidateHash: hash,
+                                                 candidateTags: makeTags(track: nil),
+                                                 candidateDurationSeconds: 200.0,
+                                                 libraryTracks: [twinB])
+        XCTAssertEqual(surveyB.matchKind, .needsReview,
+                       "a missing axis on the candidate side cannot prove identity - review")
+    }
+
+    func test_classify_missingDurationOnEitherSide_requiresReview() throws {
+        let candidate = try makeCandidate()
+        let libraryFile = try makeFile(name: "library.aac", bytes: [9, 9, 9, 9])
+        let hash = LocalImportEngine.sha256Hex(fileURL: candidate)!
+
+        let twinNoDuration = makeTwin(location: libraryFile.path, duration: nil)
+        let surveyA = MusicImportEngine.classify(filePath: candidate.path,
+                                                 candidateHash: hash,
+                                                 candidateTags: makeTags(),
+                                                 candidateDurationSeconds: 200.0,
+                                                 libraryTracks: [twinNoDuration])
+        XCTAssertEqual(surveyA.matchKind, .needsReview,
+                       "no library duration: cannot compare recordings - review")
+
+        let twinB = makeTwin(location: libraryFile.path)
+        let surveyB = MusicImportEngine.classify(filePath: candidate.path,
+                                                 candidateHash: hash,
+                                                 candidateTags: makeTags(),
+                                                 candidateDurationSeconds: nil,
+                                                 libraryTracks: [twinB])
+        XCTAssertEqual(surveyB.matchKind, .needsReview,
+                       "no candidate duration: cannot compare recordings - review")
+    }
+
+    func test_classify_byteIdenticalStillWinsOverVerifiedExisting() throws {
+        // Byte-identical: the strongest identity proof - must keep
+        // classifying as exactDuplicate even when metadata would also
+        // verify (byte equality outranks metadata verification, and the
+        // byte check runs first).
+        let bytes: [UInt8] = Array(0..<64).map { UInt8($0 % 251) }
+        let candidate = try makeCandidate(bytes: bytes)
+        let libraryFile = try makeFile(name: "library.m4a", bytes: bytes)
+        let twin = makeTwin(title: "candidate", location: libraryFile.path)
+        let hash = LocalImportEngine.sha256Hex(fileURL: candidate)!
+
+        let survey = MusicImportEngine.classify(filePath: candidate.path,
+                                                candidateHash: hash,
+                                                candidateTags: makeTags(title: "candidate"),
+                                                candidateDurationSeconds: 200.0,
+                                                libraryTracks: [twin])
+
+        XCTAssertEqual(survey.matchKind, .exactDuplicate)
+        XCTAssertEqual(survey.duplicate?.persistentID, "TW01")
+    }
+
+    func test_classify_noCandidateTags_metadataCandidate_requiresReview() throws {
+        // Compatibility: the pre-GAP C behavior - a metadata candidate
+        // with no candidate tags stays a review, never an auto-skip.
+        let candidate = try makeCandidate()
+        let libraryFile = try makeFile(name: "library.aac", bytes: [9, 9, 9, 9])
+        let twin = makeTwin(location: libraryFile.path)
+        let hash = LocalImportEngine.sha256Hex(fileURL: candidate)!
+
+        let survey = MusicImportEngine.classify(filePath: candidate.path,
+                                                candidateHash: hash,
+                                                candidateTags: nil,
+                                                candidateDurationSeconds: nil,
+                                                libraryTracks: [twin])
+
+        XCTAssertEqual(survey.matchKind, .needsReview,
+                       "nil candidate tags must keep the conservative review, same as pre-GAP C")
+    }
+
+    func test_classify_verifiedExisting_skipsImportWithoutAdd() async throws {
+        // End-to-end through importFile: a verified-existing twin is
+        // skipped (skippedDuplicate outcome) and Music is never written.
+        let candidate = try makeCandidate()
+        let libraryFile = try makeFile(name: "library.aac", bytes: [9, 9, 9, 9])
+        let twin = makeTwin(id: "VE09", title: "candidate",
+                            location: libraryFile.path, duration: 200.0)
+        let scripting = FakeMusicScripting(library: [twin])
+        let engine = MusicImportEngine(scripting: scripting)
+
+        let outcome = await engine.importFile(file: candidate,
+                                              titleQuery: "candidate",
+                                              candidateTags: makeTags(title: "candidate"),
+                                              candidateDurationSeconds: 200.0,
+                                              journal: makeJournal(),
+                                              priorRecords: [])
+
+        XCTAssertEqual(outcome.status, .skippedDuplicate,
+                       "a verified-existing recording must skip import")
+        XCTAssertEqual(outcome.decision, .skipVerifiedExisting)
+        XCTAssertEqual(scripting.addCalls.count, 0,
+                       "a verified-existing skip must never write to Music")
+        XCTAssertEqual(outcome.persistentID, "VE09")
+    }
+
+    func test_classify_verifiedExisting_reviewResolvedDoesNotOverride() async throws {
+        // Owner rule mirror of the exactDuplicate case: an explicit user
+        // resolution can NEVER override a verified-existing skip - the
+        // fresh survey governs.
+        let candidate = try makeCandidate()
+        let libraryFile = try makeFile(name: "library.aac", bytes: [9, 9, 9, 9])
+        let twin = makeTwin(id: "VE10", title: "candidate",
+                            location: libraryFile.path, duration: 200.0)
+        let scripting = FakeMusicScripting(library: [twin])
+        let engine = MusicImportEngine(scripting: scripting)
+
+        let outcome = await engine.importFile(file: candidate,
+                                              titleQuery: "candidate",
+                                              candidateTags: makeTags(title: "candidate"),
+                                              candidateDurationSeconds: 200.0,
+                                              journal: makeJournal(),
+                                              priorRecords: [],
+                                              reviewResolved: true)
+
+        XCTAssertEqual(outcome.status, .skippedDuplicate,
+                       "reviewResolved must never override a verified-existing twin")
+        XCTAssertEqual(scripting.addCalls.count, 0)
+    }
+
+    func test_decision_mapping_verifiedExisting() throws {
+        // decision(for:) maps verifiedExisting to skipVerifiedExisting so
+        // the import path skips without ever reaching the write.
+        let survey = MusicLibraryCandidate(matchKind: .verifiedExisting,
+                                           candidates: [],
+                                           duplicate: makeTwin(location: "/x"))
+        XCTAssertEqual(MusicImportEngine.decision(for: survey), .skipVerifiedExisting)
+    }
+
+    // MARK: GAP C item 5 - tag-preferred title query
+
+    func test_surveyFile_prefersTagTitleOverFilename() async throws {
+        // The FLAC's tags say "Golden Hour"; the FILENAME says "01_track".
+        // Music's `search` is contains-match, so searching the tag title
+        // finds the recording the filename query would have missed.
+        let bytes: [UInt8] = Array(0..<64).map { UInt8($0 % 251) }
+        let file = try makeFile(name: "01_track.flac", bytes: bytes)
+        let libraryFile = try makeFile(name: "library.aac", bytes: bytes)
+        let scripting = FakeMusicScripting(library: [
+            makeTwin(id: "TAG1", title: "Golden Hour", location: libraryFile.path),
+        ])
+        let engine = MusicImportEngine(scripting: scripting)
+
+        let survey = await engine.surveyFile(file: file,
+                                             candidateTags: makeTags(title: "Golden Hour"),
+                                             candidateDurationSeconds: 200.0)
+
+        XCTAssertEqual(scripting.searchQueries, ["Golden Hour"],
+                       "the search query must prefer the tag title over the filename derivation")
+        XCTAssertEqual(survey?.matchKind, .exactDuplicate)
+    }
+
+    func test_surveyFile_taglessFallsBackToFilenameQuery() async throws {
+        let file = try makeFile(name: "tone.m4a", bytes: [1, 2, 3])
+        let scripting = FakeMusicScripting()
+        let engine = MusicImportEngine(scripting: scripting)
+
+        let survey = await engine.surveyFile(file: file, candidateTags: nil,
+                                             candidateDurationSeconds: nil)
+
+        XCTAssertEqual(scripting.searchQueries, ["tone"],
+                       "without tags the canonical filename-derived query is used")
+        XCTAssertEqual(survey?.matchKind, .noCandidate)
+    }
+
+    func test_importFile_prefersTagTitleQuery() async throws {
+        let candidate = try makeCandidate()
+        let scripting = FakeMusicScripting()
+        let engine = MusicImportEngine(scripting: scripting)
+
+        _ = await engine.importFile(file: candidate,
+                                    titleQuery: "candidate",
+                                    candidateTags: makeTags(title: "Golden Hour"),
+                                    candidateDurationSeconds: 200.0,
+                                    journal: makeJournal(),
+                                    priorRecords: [])
+
+        XCTAssertEqual(scripting.searchQueries, ["Golden Hour"],
+                       "importFile must prefer the tag title as the survey query")
+    }
+
+    func test_importFile_taglessKeepsExplicitTitleQuery() async throws {
+        let candidate = try makeCandidate()
+        let scripting = FakeMusicScripting()
+        let engine = MusicImportEngine(scripting: scripting)
+
+        _ = await engine.importFile(file: candidate,
+                                    titleQuery: "explicit query",
+                                    candidateTags: nil,
+                                    candidateDurationSeconds: nil,
+                                    journal: makeJournal(),
+                                    priorRecords: [])
+
+        XCTAssertEqual(scripting.searchQueries, ["explicit query"],
+                       "without tags the caller-provided titleQuery remains the query")
+    }
 }

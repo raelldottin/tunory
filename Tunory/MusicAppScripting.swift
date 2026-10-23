@@ -12,7 +12,13 @@ import TunoryCore
 /// verified Music.app 1.7 sdef surface (t_dc244b34):
 ///   * version probe:        `tell application "Music" to get version`
 ///   * library count:        `count file tracks of library playlist 1`
-///   * read-only search:     `search library playlist 1 for "<query>"`
+///   * read-only search:     `search library playlist 1 for "<query>"`,
+///                           then per matched track fetch persistent ID,
+///                           name, artist, album, album artist, disc
+///                           number, track number, POSIX location and
+///                           duration (9 tab-separated fields) so the
+///                           engine's six-axis sameRecording comparison
+///                           has the metadata it needs (t_e6a35c8e)
 ///   * add (the only write): `add POSIX file "<path>" to library playlist 1`
 ///
 /// Live-verified read-only on this machine (t_31cf5210 platform sweep):
@@ -72,10 +78,16 @@ final class MusicAppScripting: MusicScripting {
         let count = Int(countDescriptor.int32Value)
         guard count > 0 else { return [] }
 
-        // Step 2: one script collects persistent ID, name, POSIX location
-        // and duration per matched track, tab/linefeed delimited. Per-field
-        // try guards: streaming tracks have no location, some tracks lack
-        // names - a missing field is empty text, not a survey failure.
+        // Step 2: one script collects the nine decision fields per
+        // matched track, tab/linefeed delimited: persistent ID, name,
+        // artist, album, album artist, disc number, track number, POSIX
+        // location, duration. The metadata axes beyond name are what the
+        // engine's six-axis sameRecording comparison needs to prove a
+        // cross-format verified-existing match (t_e6a35c8e) - without
+        // them every metadata match degrades to needsReview and only
+        // byte-identical hashes could ever skip. Per-field try guards:
+        // streaming tracks have no location, some tracks lack names or
+        // tag axes - a missing field is empty text, not a survey failure.
         let source = """
         tell application "Music"
             set out to ""
@@ -87,6 +99,31 @@ final class MusicAppScripting: MusicScripting {
                 end try
                 try
                     set out to out & ((name of t) as text) & tab
+                on error
+                    set out to out & "" & tab
+                end try
+                try
+                    set out to out & ((artist of t) as text) & tab
+                on error
+                    set out to out & "" & tab
+                end try
+                try
+                    set out to out & ((album of t) as text) & tab
+                on error
+                    set out to out & "" & tab
+                end try
+                try
+                    set out to out & ((album artist of t) as text) & tab
+                on error
+                    set out to out & "" & tab
+                end try
+                try
+                    set out to out & ((disc number of t) as text) & tab
+                on error
+                    set out to out & "" & tab
+                end try
+                try
+                    set out to out & ((track number of t) as text) & tab
                 on error
                     set out to out & "" & tab
                 end try
@@ -120,15 +157,30 @@ final class MusicAppScripting: MusicScripting {
 
         var refs: [MusicTrackRef] = []
         for line in raw.components(separatedBy: "\n") where !line.isEmpty {
+            // Wire order mirrors MusicTrackRef: persistent ID, name,
+            // artist, album, album artist, disc number, track number,
+            // POSIX location, duration. Empty or unparseable disc/track
+            // numbers become nil: an unprovable axis stays unprovable
+            // (conservative review), never guessed into a match.
             let fields = line.components(separatedBy: "\t")
-            guard fields.count == 4 else { continue }
+            guard fields.count == 9 else { continue }
             let pid = fields[0]
             guard !pid.isEmpty else { continue }
             let name = fields[1].isEmpty ? nil : fields[1]
-            let location = fields[2].isEmpty ? nil : unquote(fields[2])
-            let duration = Double(fields[3])
+            let artist = fields[2].isEmpty ? nil : fields[2]
+            let album = fields[3].isEmpty ? nil : fields[3]
+            let albumArtist = fields[4].isEmpty ? nil : fields[4]
+            let discNumber = fields[5].isEmpty ? nil : Int(fields[5])
+            let trackNumber = fields[6].isEmpty ? nil : Int(fields[6])
+            let location = fields[7].isEmpty ? nil : unquote(fields[7])
+            let duration = Double(fields[8])
             refs.append(MusicTrackRef(persistentID: pid,
                                       name: name,
+                                      artist: artist,
+                                      album: album,
+                                      albumArtist: albumArtist,
+                                      discNumber: discNumber,
+                                      trackNumber: trackNumber,
                                       locationPath: location,
                                       durationSeconds: duration))
         }
@@ -156,6 +208,31 @@ final class MusicAppScripting: MusicScripting {
                 set out to out & "" & tab
             end try
             try
+                set out to out & ((artist of t) as text) & tab
+            on error
+                set out to out & "" & tab
+            end try
+            try
+                set out to out & ((album of t) as text) & tab
+            on error
+                set out to out & "" & tab
+            end try
+            try
+                set out to out & ((album artist of t) as text) & tab
+            on error
+                set out to out & "" & tab
+            end try
+            try
+                set out to out & ((disc number of t) as text) & tab
+            on error
+                set out to out & "" & tab
+            end try
+            try
+                set out to out & ((track number of t) as text) & tab
+            on error
+                set out to out & "" & tab
+            end try
+            try
                 set out to out & (POSIX path of (location of t)) & tab
             on error
                 set out to out & "" & tab
@@ -172,15 +249,24 @@ final class MusicAppScripting: MusicScripting {
               let raw = descriptor.stringValue, !raw.isEmpty else {
             return nil
         }
+        // Same 9-field wire order as searchLibrary: persistent ID, name,
+        // artist, album, album artist, disc number, track number, POSIX
+        // location, duration. Empty or unparseable disc/track numbers
+        // become nil (unprovable, never guessed into a match).
         let fields = raw.components(separatedBy: "\t")
-        guard fields.count == 4, !fields[0].isEmpty else { return nil }
-        var location = fields[2]
+        guard fields.count == 9, !fields[0].isEmpty else { return nil }
+        var location = fields[7]
         if location.hasPrefix("\"") { location.removeFirst() }
         if location.hasSuffix("\"") { location.removeLast() }
         return MusicTrackRef(persistentID: fields[0],
                              name: fields[1].isEmpty ? nil : fields[1],
+                             artist: fields[2].isEmpty ? nil : fields[2],
+                             album: fields[3].isEmpty ? nil : fields[3],
+                             albumArtist: fields[4].isEmpty ? nil : fields[4],
+                             discNumber: fields[5].isEmpty ? nil : Int(fields[5]),
+                             trackNumber: fields[6].isEmpty ? nil : Int(fields[6]),
                              locationPath: location.isEmpty ? nil : location,
-                             durationSeconds: Double(fields[3]))
+                             durationSeconds: Double(fields[8]))
     }
 
     func add(file: URL) async -> String? {

@@ -120,6 +120,93 @@ final class LocalImportEngineTests: XCTestCase {
         XCTAssertTrue(probe.musicImportable)
     }
 
+    // MARK: - GAP C item 3: standalone tags loader (six axes)
+
+    func testLoadTagsSixAxesFromVorbisComments() async throws {
+        // Full vorbis axis set the classifier compares, incl. the three
+        // GAP B extended fields (ALBUMARTIST/DISCNUMBER/TRACKNUMBER).
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        let flac = work.appendingPathComponent("tagged.flac")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                                "-f", "flac", "-c:a", "flac",
+                                "-metadata", "title=Golden Hour",
+                                "-metadata", "artist=Artist",
+                                "-metadata", "album=Album",
+                                "-metadata", "ALBUMARTIST=Album Artist",
+                                "-metadata", "DISCNUMBER=2",
+                                "-metadata", "TRACKNUMBER=7/12",
+                                flac.path])
+        let tags = await AudioProber().loadTags(url: flac)
+        XCTAssertNotNil(tags)
+        XCTAssertEqual(tags?.title, "Golden Hour")
+        XCTAssertEqual(tags?.artist, "Artist")
+        XCTAssertEqual(tags?.album, "Album")
+        XCTAssertEqual(tags?.albumArtist, "Album Artist")
+        XCTAssertEqual(tags?.discNumber, 2, "vorbis DISCNUMBER must parse via the GAP B mapping")
+        XCTAssertEqual(tags?.trackNumber, 7, "vorbis 'n/total' TRACKNUMBER must yield the number")
+    }
+
+    func testLoadTagsReusesID3Mapping() async throws {
+        // The GAP B source-identifier table is the single mapping: id3
+        // TPE2/TPOS/TRCK must reach the loader exactly like vorbis.
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        let mp3 = work.appendingPathComponent("id3tagged.mp3")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=550:duration=3",
+                                "-c:a", "libmp3lame", "-b:a", "128k", "-id3v2_version", "3",
+                                "-metadata", "title=ID3 Tone",
+                                "-metadata", "TPE2=ID3 Album Artist",
+                                "-metadata", "TPOS=2/2", "-metadata", "TRCK=7/12",
+                                mp3.path])
+        let tags = await AudioProber().loadTags(url: mp3)
+        XCTAssertNotNil(tags)
+        XCTAssertEqual(tags?.title, "ID3 Tone")
+        XCTAssertEqual(tags?.albumArtist, "ID3 Album Artist")
+        XCTAssertEqual(tags?.discNumber, 2)
+        XCTAssertEqual(tags?.trackNumber, 7)
+    }
+
+    func testLoadTagsTaglessFileYieldsAllNilAxes() async throws {
+        let bare = try makeFLAC(name: "bare.flac", metadata: false)
+        let tags = await AudioProber().loadTags(url: bare)
+        XCTAssertEqual(tags, AudioMetadataTags(title: nil, artist: nil, album: nil,
+                                               albumArtist: nil, discNumber: nil,
+                                               trackNumber: nil),
+                       "a tagless file must load all-nil axes, never guessed values")
+    }
+
+    func testLoadTagsCorruptFileIsFailVisible() async throws {
+        let corrupt = work.appendingPathComponent("corrupt-tags.flac")
+        try makeCorruptFile(corrupt)
+        let tags = await AudioProber().loadTags(url: corrupt)
+        // Fail-visible: either the survey fails outright (nil) or every
+        // axis is nil. Never invented values.
+        if let tags {
+            XCTAssertEqual(tags, AudioMetadataTags(title: nil, artist: nil, album: nil,
+                                                  albumArtist: nil, discNumber: nil,
+                                                  trackNumber: nil))
+        }
+    }
+
+    func testLoadTagsGarbagePositionalTagsStayNil() async throws {
+        // "handle various FLAC tag formats gracefully": unparseable
+        // positional values must be skipped, never guessed.
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        let flac = work.appendingPathComponent("garbage.flac")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                                "-f", "flac", "-c:a", "flac",
+                                "-metadata", "title=Garbage",
+                                "-metadata", "TRACKNUMBER=not-a-number",
+                                "-metadata", "DISCNUMBER=-1",
+                                flac.path])
+        let tags = await AudioProber().loadTags(url: flac)
+        XCTAssertEqual(tags?.title, "Garbage")
+        XCTAssertNil(tags?.trackNumber, "unparseable TRACKNUMBER must stay nil")
+        XCTAssertNil(tags?.discNumber, "negative DISCNUMBER must stay nil")
+    }
+
     // MARK: - Planning (deterministic decisions)
 
     func testPlanPassthroughForLossySources() async throws {
@@ -211,6 +298,292 @@ final class LocalImportEngineTests: XCTestCase {
                      "two read-denied files must never be byte-duplicates of each other")
         XCTAssertNil(plan.entries[0].sourceSHA256)
         XCTAssertNil(plan.entries[1].sourceSHA256)
+    }
+
+    // MARK: - Multi-root folder planning (GAP A, phase 11)
+
+    /// Minimal valid mono 16-bit PCM WAV (~1 s), hand-built so folder
+    /// planning tests never depend on ffmpeg. WAV is lossless (lpcm),
+    /// so it plans as `.convert` under the AAC-256 reference profile.
+    static func makeWAVFixture(at url: URL, frequency: Double = 440) throws {
+        let sampleRate = 44_100.0
+        let frames = Int(sampleRate)
+        var samples = [Int16](repeating: 0, count: frames)
+        for i in 0..<frames {
+            let t = Double(i) / sampleRate
+            samples[i] = Int16((sin(2 * .pi * frequency * t) * 0.4) * Double(Int16.max))
+        }
+        var data = Data()
+        func append(_ s: String) { data.append(s.data(using: .ascii)!) }
+        func append32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        func append16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        append("RIFF"); append32(UInt32(36 + frames * 2)); append("WAVE")
+        append("fmt "); append32(16); append16(1); append16(1)
+        append32(UInt32(sampleRate)); append32(UInt32(sampleRate * 2)); append16(2); append16(16)
+        append("data"); append32(UInt32(frames * 2))
+        for s in samples { append16(UInt16(bitPattern: s)) }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try data.write(to: url)
+    }
+
+    /// A single selected folder must plan exactly like the CLI batch
+    /// walk — the GUI folder picker is a new presentation of the SAME
+    /// canonical plan, never a second decision path.
+    func testPlanBatchesSingleRootEqualsPlanBatch() async throws {
+        let album = work.appendingPathComponent("AlbumA", isDirectory: true)
+        try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
+        try Self.makeWAVFixture(at: album.appendingPathComponent("01 Track.wav"))
+        let engine = LocalImportEngine()
+        let out = work.appendingPathComponent("out")
+        let batch = await engine.planBatch(sourceRoot: album, outputRoot: out,
+                                           profile: .aac256, journalRecords: [])
+        let batches = await engine.planBatches(sourceRoots: [album], outputRoot: out,
+                                               profile: .aac256, journalRecords: [])
+        XCTAssertEqual(batch.entries, batches.entries,
+                       "single-root planBatches must equal planBatch entry for entry")
+    }
+
+    /// Multiple selected album folders: each root's entries carry the
+    /// album folder name as prefix, so same-named tracks in different
+    /// albums plan to distinct per-album destinations (no collision).
+    func testPlanBatchesMultipleRootsPreservePerAlbumStructure() async throws {
+        for album in ["AlbumA", "AlbumB"] {
+            let dir = work.appendingPathComponent(album, isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Self.makeWAVFixture(at: dir.appendingPathComponent("01 Track.wav"))
+        }
+        let engine = LocalImportEngine()
+        let out = work.appendingPathComponent("out")
+        let plan = await engine.planBatches(
+            sourceRoots: [work.appendingPathComponent("AlbumA"),
+                          work.appendingPathComponent("AlbumB")],
+            outputRoot: out, profile: .aac256, journalRecords: [])
+        XCTAssertEqual(plan.entries.count, 2)
+        XCTAssertEqual(plan.entries.map(\.relativePath).sorted(),
+                       ["AlbumA/01 Track.wav", "AlbumB/01 Track.wav"],
+                       "each root's entries must be prefixed with the album folder name")
+        XCTAssertEqual(plan.entries.map(\.destinationPath).sorted(),
+                       [out.appendingPathComponent("AlbumA/01 Track.m4a").path,
+                        out.appendingPathComponent("AlbumB/01 Track.m4a").path].sorted(),
+                       "same-named tracks in different albums must not collide at the destination")
+        for entry in plan.entries {
+            XCTAssertEqual(entry.decision, .convert,
+                           "valid lossless WAVs must plan as convert under AAC-256")
+        }
+    }
+
+    /// Requirement 1's two selection modes must be equivalent: selecting
+    /// the parent folder or selecting the album folders directly
+    /// produces the same plan for the same collection.
+    func testPlanBatchesParentSelectionMatchesAlbumsSelection() async throws {
+        for album in ["AlbumA", "AlbumB"] {
+            let dir = work.appendingPathComponent(album, isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Self.makeWAVFixture(at: dir.appendingPathComponent("01 Track.wav"))
+        }
+        let engine = LocalImportEngine()
+        let out = work.appendingPathComponent("out")
+        let parentPlan = await engine.planBatches(sourceRoots: [work], outputRoot: out,
+                                                  profile: .aac256, journalRecords: [])
+        let albumsPlan = await engine.planBatches(
+            sourceRoots: [work.appendingPathComponent("AlbumA"),
+                          work.appendingPathComponent("AlbumB")],
+            outputRoot: out, profile: .aac256, journalRecords: [])
+        XCTAssertEqual(parentPlan.entries, albumsPlan.entries,
+                       "parent-folder and album-folder selection must produce identical plans")
+    }
+
+    /// Byte-identical recordings in two different selected folders must
+    /// still be flagged as batch duplicates for explicit review.
+    func testPlanBatchesFlagsByteDuplicatesAcrossFolders() async throws {
+        let a = work.appendingPathComponent("AlbumA", isDirectory: true)
+        let b = work.appendingPathComponent("AlbumB", isDirectory: true)
+        try FileManager.default.createDirectory(at: a, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: b, withIntermediateDirectories: true)
+        try Self.makeWAVFixture(at: a.appendingPathComponent("shared.wav"))
+        try FileManager.default.copyItem(at: a.appendingPathComponent("shared.wav"),
+                                         to: b.appendingPathComponent("same-bytes.wav"))
+        let engine = LocalImportEngine()
+        let plan = await engine.planBatches(sourceRoots: [a, b],
+                                            outputRoot: work.appendingPathComponent("out"),
+                                            profile: .aac256, journalRecords: [])
+        XCTAssertEqual(plan.entries.count, 2)
+        let first = plan.entries.first { $0.sourcePath.hasSuffix("shared.wav") }!
+        let second = plan.entries.first { $0.sourcePath.hasSuffix("same-bytes.wav") }!
+        XCTAssertNil(first.duplicateOfIndex)
+        XCTAssertNotNil(second.duplicateOfIndex,
+                        "byte-identical recordings across two selected folders must be flagged for review")
+    }
+
+    /// The same folder handed twice (panel quirk) must plan once —
+    /// deterministic, no double walk.
+    func testPlanBatchesPlansIdenticalRootOnce() async throws {
+        let album = work.appendingPathComponent("AlbumA", isDirectory: true)
+        try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
+        try Self.makeWAVFixture(at: album.appendingPathComponent("01 Track.wav"))
+        let engine = LocalImportEngine()
+        let plan = await engine.planBatches(sourceRoots: [album, album],
+                                            outputRoot: work.appendingPathComponent("out"),
+                                            profile: .aac256, journalRecords: [])
+        XCTAssertEqual(plan.entries.count, 1,
+                       "an identical root handed twice must plan exactly once")
+    }
+
+    /// Adversarial edge: two DIFFERENT roots that share a folder name
+    /// ("Greatest Hits" from two parents) prefix to the same relative
+    /// paths, so their destinations collide. Planning must stay
+    /// deterministic and honest: both entries present, both `.convert`
+    /// (a plan never writes); the promote-time destination guard owns
+    /// the actual collision — a foreign file is never overwritten.
+    func testPlanBatchesSameNamedRootsCollideDeterministically() async throws {
+        let parent1 = work.appendingPathComponent("col1", isDirectory: true)
+        let parent2 = work.appendingPathComponent("col2", isDirectory: true)
+        let r1 = parent1.appendingPathComponent("Greatest", isDirectory: true)
+        let r2 = parent2.appendingPathComponent("Greatest", isDirectory: true)
+        try FileManager.default.createDirectory(at: r1, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: r2, withIntermediateDirectories: true)
+        try Self.makeWAVFixture(at: r1.appendingPathComponent("01.wav"), frequency: 440)
+        try Self.makeWAVFixture(at: r2.appendingPathComponent("01.wav"), frequency: 660)
+        let engine = LocalImportEngine()
+        let plan = await engine.planBatches(sourceRoots: [r1, r2],
+                                            outputRoot: work.appendingPathComponent("out"),
+                                            profile: .aac256, journalRecords: [])
+        XCTAssertEqual(plan.entries.count, 2)
+        XCTAssertEqual(Set(plan.entries.map(\.destinationPath)).count, 1,
+                       "same-named roots document a real destination edge: identical planned paths")
+        XCTAssertEqual(plan.entries.map(\.sourcePath),
+                       plan.entries.map(\.sourcePath).sorted(),
+                       "entries stay deterministically ordered")
+        for entry in plan.entries {
+            XCTAssertEqual(entry.decision, .convert,
+                           "planning never writes; the promote-time guard owns the collision")
+        }
+    }
+
+    // MARK: - Phase 11 t_72d1c24a: multi-root nested FLAC selection
+
+    /// The four-album selection shape in one canonical proof (card
+    /// t_72d1c24a): MULTIPLE selected album folders — exactly what the
+    /// GUI folder picker hands `select(folders:)` → `planBatches` — each
+    /// containing NESTED disc subfolders (CD1/CD2), holding real FLAC
+    /// with the full metadata set (album title, album artist, track
+    /// artist, song title, disc number, track number) plus embedded
+    /// PICTURE artwork. Recursive discovery must find every file
+    /// through both roots, relative paths must preserve album + disc
+    /// structure, conversion must create the nested destination
+    /// layout and carry ALL six axes + artwork onto the outputs, and
+    /// the original FLAC files must stay byte-identical.
+    func testMultiRootNestedFLACDiscoveryPreservesAllMetadata() async throws {
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+
+        // Fixture descriptor: one row per FLAC track under a selected root.
+        struct NestedTrack {
+            let rootName: String
+            let dir: URL
+            let name: String
+            let title: String
+            let track: Int
+            let disc: Int
+            let album: String
+            let band: String
+            var relativePath: String { rootName + "/" + dir.lastPathComponent + "/" + name }
+        }
+
+        // Two selected album folders, each with nested disc subfolders:
+        // a flat walk would find none of these files.
+        let alpha = work.appendingPathComponent("AlbumAlpha", isDirectory: true)
+        let beta = work.appendingPathComponent("AlbumBeta", isDirectory: true)
+        let alphaCD1 = alpha.appendingPathComponent("CD1", isDirectory: true)
+        let alphaCD2 = alpha.appendingPathComponent("CD2", isDirectory: true)
+        let betaCD1 = beta.appendingPathComponent("CD1", isDirectory: true)
+        for dir in [alphaCD1, alphaCD2, betaCD1] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+
+        let png = try Self.makeTinyPNG(in: work)
+        let tracks: [NestedTrack] = [
+            NestedTrack(rootName: "AlbumAlpha", dir: alphaCD1, name: "01 Open Tone.flac",
+                        title: "Open Tone", track: 1, disc: 1, album: "Alpha Album", band: "Alpha Band"),
+            NestedTrack(rootName: "AlbumAlpha", dir: alphaCD1, name: "02 Second Tone.flac",
+                        title: "Second Tone", track: 2, disc: 1, album: "Alpha Album", band: "Alpha Band"),
+            NestedTrack(rootName: "AlbumAlpha", dir: alphaCD2, name: "01 Late Tone.flac",
+                        title: "Late Tone", track: 1, disc: 2, album: "Alpha Album", band: "Alpha Band"),
+            NestedTrack(rootName: "AlbumBeta", dir: betaCD1, name: "01 Beta Tone.flac",
+                        title: "Beta Tone", track: 1, disc: 1, album: "Beta Album", band: "Beta Band"),
+        ]
+        var sourceHashes: [String: String?] = [:]
+        for t in tracks {
+            let out = t.dir.appendingPathComponent(t.name)
+            try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                    "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                                    "-i", png.path,
+                                    "-map", "0:a", "-map", "1:v",
+                                    "-c:a", "flac", "-c:v", "png",
+                                    "-disposition:v", "attached_pic",
+                                    "-metadata", "title=\(t.title)",
+                                    "-metadata", "artist=Track Artist \(t.track)",
+                                    "-metadata", "album=\(t.album)",
+                                    "-metadata", "ALBUMARTIST=\(t.band)",
+                                    "-metadata", "DISCNUMBER=\(t.disc)",
+                                    "-metadata", "TRACKNUMBER=\(t.track)",
+                                    "-f", "flac", out.path])
+            sourceHashes[t.name] = LocalImportEngine.sha256Hex(fileURL: out)
+        }
+
+        let out = work.appendingPathComponent("out")
+        let engine = LocalImportEngine()
+        let journal = LocalImportJournal(directory: out.appendingPathComponent(".tunory"))
+        let plan = await engine.planBatches(sourceRoots: [alpha, beta],
+                                            outputRoot: out,
+                                            profile: .aac256, journalRecords: [])
+
+        // Recursive discovery through both selected roots: all four
+        // tracks found, every relative path carrying album + disc structure.
+        XCTAssertEqual(plan.entries.count, 4,
+                       "recursive discovery must find every FLAC under both selected folders")
+        XCTAssertEqual(plan.entries.map(\.relativePath).sorted(),
+                       tracks.map(\.relativePath).sorted(),
+                       "multi-root planning must preserve album + nested disc structure in every path")
+        for entry in plan.entries {
+            XCTAssertEqual(entry.decision, .convert, "valid FLAC must plan as convert")
+        }
+
+        for entry in plan.entries {
+            let outcome = await engine.convert(entry: entry, profile: .aac256, journal: journal)
+            XCTAssertEqual(outcome.status, .converted, outcome.detail ?? "")
+        }
+
+        // Per-file: nested destination created, six metadata axes +
+        // artwork carried, original untouched.
+        for t in tracks {
+            let dest = out.appendingPathComponent(t.relativePath)
+                .deletingPathExtension().appendingPathExtension("m4a")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: dest.path),
+                          "conversion must create the nested destination: \(dest.path)")
+
+            let metadata = try await Self.commonMetadata(of: dest)
+            XCTAssertEqual(metadata["title"], t.title, "song title must survive")
+            XCTAssertEqual(metadata["artist"], "Track Artist \(t.track)", "track artist must survive")
+            XCTAssertEqual(metadata["album"], t.album, "album title must survive")
+
+            let dump = try await Self.identifierDump(of: dest)
+            XCTAssertEqual(dump["itsk/aART"], t.band, "album artist must survive")
+            let trkn = try await Self.positionalAtom(of: dest, identifier: "itsk/trkn")
+            XCTAssertEqual(trkn?.number, t.track, "track number must survive")
+            let disk = try await Self.positionalAtom(of: dest, identifier: "itsk/disk")
+            XCTAssertEqual(disk?.number, t.disc, "disc number must survive")
+
+            let source = t.dir.appendingPathComponent(t.name)
+            let pictures = try LocalImportEngine.flacPictures(in: source)
+            XCTAssertEqual(pictures.count, 1, "fixture must embed exactly one PICTURE block")
+            let artwork = try await Self.artworkData(of: dest)
+            XCTAssertEqual(artwork, pictures.first?.data,
+                           "embedded FLAC artwork must survive conversion byte-identical")
+
+            XCTAssertEqual(sourceHashes[t.name], LocalImportEngine.sha256Hex(fileURL: source),
+                           "original FLAC must never be modified")
+        }
     }
 
     // MARK: - Native conversion (D1 acceptance: in-process, no external binary)
@@ -349,6 +722,179 @@ final class LocalImportEngineTests: XCTestCase {
         if let data = artwork {
             XCTAssertEqual(data.prefix(8), Self.pngMagic, "embedded artwork must be PNG data")
         }
+    }
+
+    // MARK: - Extended metadata carry (GAP B, phase 11)
+
+    /// Full identifier dump of a file via AVFoundation (every format,
+    /// identifier-qualified). Used by the GAP B roundtrip tests to prove
+    /// the extended fields land as the exact iTunes-family atoms.
+    static func identifierDump(of url: URL) async throws -> [String: String] {
+        let asset = AVURLAsset(url: url)
+        var result: [String: String] = [:]
+        let formats = try await asset.load(.availableMetadataFormats)
+        for format in formats {
+            let items = try await asset.loadMetadata(for: format)
+            for item in items {
+                guard let identifier = item.identifier else { continue }
+                if let value = try? await item.load(.stringValue) {
+                    result[identifier.rawValue] = value
+                }
+            }
+        }
+        return result
+    }
+
+    func testConvertFLACCarriesAlbumArtistDiscTrack() async throws {
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        // FLAC with the three GAP B fields (vorbis comments) + base tags.
+        let flac = work.appendingPathComponent("extended.flac")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                                "-c:a", "flac",
+                                "-metadata", "title=Ext Tone", "-metadata", "artist=Ext Artist",
+                                "-metadata", "album=Ext Album",
+                                "-metadata", "ALBUMARTIST=Ext Album Artist",
+                                "-metadata", "DISCNUMBER=2", "-metadata", "TRACKNUMBER=7",
+                                flac.path])
+
+        let outDir = work.appendingPathComponent("out", isDirectory: true)
+        let engine = LocalImportEngine()
+        let journal = LocalImportJournal(directory: outDir.appendingPathComponent(".tunory"))
+        let plan = await engine.planBatch(sourceRoot: work, outputRoot: outDir,
+                                            profile: .aac256, journalRecords: [])
+        let entry = plan.entries.first { $0.sourcePath.hasSuffix("extended.flac") }!
+        let outcome = await engine.convert(entry: entry, profile: .aac256, journal: journal)
+        XCTAssertEqual(outcome.status, .converted, outcome.detail ?? "")
+
+        let dest = URL(fileURLWithPath: entry.destinationPath)
+        let metadata = try await Self.commonMetadata(of: dest)
+        XCTAssertEqual(metadata["title"], "Ext Tone")
+        XCTAssertEqual(metadata["artist"], "Ext Artist")
+        XCTAssertEqual(metadata["album"], "Ext Album")
+
+        // GAP B contract: the three fields that lack common keys must land
+        // as iTunes-family atoms on the converted m4a.
+        let dump = try await Self.identifierDump(of: dest)
+        XCTAssertEqual(dump["itsk/aART"], "Ext Album Artist",
+                       "album artist must survive conversion")
+        let trkn = try await Self.positionalAtom(of: dest, identifier: "itsk/trkn")
+        XCTAssertEqual(trkn?.number, 7, "track number must survive conversion")
+        let disk = try await Self.positionalAtom(of: dest, identifier: "itsk/disk")
+        XCTAssertEqual(disk?.number, 2, "disc number must survive conversion")
+    }
+
+    func testApplyMetadataCarriesID3AlbumArtistDiscTrack() async throws {
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        // MP3 sources are passthroughNative in the convert flow (lossy →
+        // no re-encode), so the id3/* mapping is exercised through the
+        // metadata stage itself: encode the mp3 once, then apply metadata
+        // from the ID3-tagged source onto that encoded file.
+        let mp3 = work.appendingPathComponent("tagged.mp3")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=550:duration=3",
+                                "-c:a", "libmp3lame", "-b:a", "128k", "-id3v2_version", "3",
+                                "-metadata", "title=Totalling",
+                                "-metadata", "TPE2=Total Album Artist",
+                                "-metadata", "TPOS=2/2", "-metadata", "TRCK=7/12",
+                                mp3.path])
+        let engine = LocalImportEngine()
+        let outDir = work.appendingPathComponent("out3", isDirectory: true)
+        try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+        let encoded = outDir.appendingPathComponent("encoded.m4a")
+        _ = try await engine.encode(source: mp3, output: encoded, profile: .aac256)
+        try await engine.applyMetadata(source: mp3, encoded: encoded, output: encoded)
+
+        let dump = try await Self.identifierDump(of: encoded)
+        XCTAssertEqual(dump["itsk/aART"], "Total Album Artist",
+                       "ID3 TPE2 must map onto the aART atom")
+        let trkn = try await Self.positionalAtom(of: encoded, identifier: "itsk/trkn")
+        XCTAssertEqual(trkn?.number, 7)
+        XCTAssertEqual(trkn?.total, 12, "ID3 TRCK 'n/total' totals must survive")
+        let disk = try await Self.positionalAtom(of: encoded, identifier: "itsk/disk")
+        XCTAssertEqual(disk?.number, 2)
+        XCTAssertEqual(disk?.total, 2, "ID3 TPOS 'n/total' totals must survive")
+    }
+
+    func testConvertCarriesVorbisTrackAndDiscTotals() async throws {
+        guard let ffmpeg = ffmpegURL else { throw XCTSkip("ffmpeg not installed (fixture generation only)") }
+        // Vorbis "n/total" shapes must keep BOTH number and total.
+        let flac = work.appendingPathComponent("totalling.flac")
+        try runProcess(ffmpeg, ["-nostdin", "-hide_banner", "-loglevel", "error",
+                                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                                "-c:a", "flac",
+                                "-metadata", "title=Totalling F",
+                                "-metadata", "ALBUMARTIST=Total Album Artist F",
+                                "-metadata", "DISCNUMBER=2/2", "-metadata", "TRACKNUMBER=7/12",
+                                flac.path])
+        let outDir = work.appendingPathComponent("out2", isDirectory: true)
+        let engine = LocalImportEngine()
+        let journal = LocalImportJournal(directory: outDir.appendingPathComponent(".tunory"))
+        let plan = await engine.planBatch(sourceRoot: work, outputRoot: outDir,
+                                            profile: .aac256, journalRecords: [])
+        let entry = plan.entries.first { $0.sourcePath.hasSuffix("totalling.flac") }!
+        let outcome = await engine.convert(entry: entry, profile: .aac256, journal: journal)
+        XCTAssertEqual(outcome.status, .converted, outcome.detail ?? "")
+        let dest = URL(fileURLWithPath: entry.destinationPath)
+        let dump = try await Self.identifierDump(of: dest)
+        XCTAssertEqual(dump["itsk/aART"], "Total Album Artist F")
+        let trkn = try await Self.positionalAtom(of: dest, identifier: "itsk/trkn")
+        XCTAssertEqual(trkn?.number, 7)
+        XCTAssertEqual(trkn?.total, 12, "vorbis 'n/total' totals must survive")
+        let disk = try await Self.positionalAtom(of: dest, identifier: "itsk/disk")
+        XCTAssertEqual(disk?.number, 2)
+        XCTAssertEqual(disk?.total, 2)
+    }
+
+    func testExtendedMetadataParserEdgeCases() {
+        // Deterministic parser contract, hand-built inputs (no ffmpeg).
+        // "n" and "n/t" parse; whitespace trims; garbage rejects.
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag("7")?.number, 7)
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag(" 7 ")?.number, 7)
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag("7/12")?.number, 7)
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag("7/12")?.total, 12)
+        XCTAssertNil(LocalImportEngine.parsePositionalTag("seven"))
+        XCTAssertNil(LocalImportEngine.parsePositionalTag("-1"))
+        XCTAssertNil(LocalImportEngine.parsePositionalTag(""))
+        // Unparseable total: the number still parses, so the tag is kept
+        // and only the total is dropped (documented parser contract).
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag("7/twelve")?.number, 7)
+        XCTAssertNil(LocalImportEngine.parsePositionalTag("7/twelve")?.total,
+                     "unparseable total keeps number")
+        // A total that exceeds the 16-bit atom field: the tag keeps the
+        // number, the total is dropped rather than wrapped or truncated.
+        XCTAssertEqual(LocalImportEngine.parsePositionalTag("7/70000")?.number, 7)
+        XCTAssertNil(LocalImportEngine.parsePositionalTag("7/70000")?.total)
+        XCTAssertNil(LocalImportEngine.parsePositionalTag("70000"), "number beyond 16-bit rejects the tag")
+        // Binary atom roundtrip (m4a source path).
+        let atom = LocalImportEngine.iTunesPositionalAtom(number: 7, total: 12)
+        XCTAssertEqual(atom.count, 8)
+        XCTAssertEqual([UInt8](atom), [0, 0, 0, 7, 0, 12, 0, 0])
+        XCTAssertEqual(LocalImportEngine.parsePositionalAtom(atom)?.number, 7)
+        XCTAssertEqual(LocalImportEngine.parsePositionalAtom(atom)?.total, 12)
+        // Short/garbage payloads reject, never guess.
+        XCTAssertNil(LocalImportEngine.parsePositionalAtom(Data([0, 0, 0])))
+        XCTAssertNil(LocalImportEngine.parsePositionalAtom(Data()))
+        // No-total atom: number present, total nil.
+        let noTotal = LocalImportEngine.iTunesPositionalAtom(number: 2, total: nil)
+        XCTAssertEqual(LocalImportEngine.parsePositionalAtom(noTotal)?.number, 2)
+        XCTAssertNil(LocalImportEngine.parsePositionalAtom(noTotal)?.total)
+    }
+
+    /// Read one positional iTunes atom (trkn/disk) from a file as
+    /// (number, total) via AVFoundation.
+    static func positionalAtom(of url: URL, identifier raw: String) async throws -> (number: Int, total: Int?)? {
+        let asset = AVURLAsset(url: url)
+        let formats = try await asset.load(.availableMetadataFormats)
+        for format in formats {
+            let items = try await asset.loadMetadata(for: format)
+            for item in items {
+                guard item.identifier?.rawValue == raw,
+                      let data = try? await item.load(.dataValue) else { continue }
+                return LocalImportEngine.parsePositionalAtom(data)
+            }
+        }
+        return nil
     }
 
     // MARK: - Idempotency + adversarial destination states (§8.3)

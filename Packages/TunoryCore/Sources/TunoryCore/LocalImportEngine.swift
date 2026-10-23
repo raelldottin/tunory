@@ -110,6 +110,20 @@ public struct LocalImportJournal: Sendable {
         self.directory = directory
     }
 
+    /// Canonical on-disk home for the journal: Application Support /
+    /// Tunory (the app container's home under the sandbox). GUI and
+    /// CLI both resolve their journal through here so conversion
+    /// evidence lives in exactly one place and user-picked
+    /// destinations receive only converted audio (design D5; C1).
+    /// Mirrors MusicImportJournal.defaultDirectory()'s fallback
+    /// shape: temporaryDirectory only as a last resort.
+    public static func defaultDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory,
+                                            in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("Tunory", isDirectory: true)
+    }
+
     public var fileURL: URL { directory.appendingPathComponent(Self.fileName) }
 
     /// Load all records; empty when absent or unreadable (fail-visible:
@@ -271,24 +285,85 @@ public struct LocalImportEngine: Sendable {
                           outputRoot: URL,
                           profile: ConversionProfile,
                           journalRecords: [LocalImportJournalRecord]) async -> LocalImportPlan {
-        var files = Self.audioFilesUnder(sourceRoot)
-        files.sort { $0.standardizedFileURL.path < $1.standardizedFileURL.path }
-        let rootPath = sourceRoot.standardizedFileURL.path
+        await planBatches(sourceRoots: [sourceRoot], outputRoot: outputRoot,
+                          profile: profile, journalRecords: journalRecords)
+    }
 
+    /// Multi-folder planning (phase 11, GAP A). The GUI folder picker
+    /// hands the user's selected folders to the SAME canonical planner
+    /// — never a second decision path. One selected root behaves
+    /// exactly like `planBatch`; multiple roots prefix each root's
+    /// entries with the selected folder's name, so selecting a parent
+    /// folder and selecting the album folders directly produce
+    /// identical destination layouts for the same collection.
+    /// Byte-duplicate detection spans all roots. Roots are
+    /// deduplicated (a panel can hand the same folder twice), and a
+    /// file reachable from two selected roots (parent + child
+    /// selection) plans exactly once — from the first root in
+    /// deterministic sorted order.
+    public func planBatches(sourceRoots: [URL],
+                            outputRoot: URL,
+                            profile: ConversionProfile,
+                            journalRecords: [LocalImportJournalRecord]) async -> LocalImportPlan {
+        var seenRoots = Set<String>()
+        var roots: [URL] = []
+        for root in sourceRoots {
+            let standardized = root.standardizedFileURL
+            if seenRoots.insert(standardized.path).inserted {
+                roots.append(standardized)
+            }
+        }
+        roots.sort { $0.path < $1.path }
+
+        let multiRoot = roots.count > 1
+        var files: [(url: URL, relativePath: String)] = []
+        var seenSources = Set<String>()
+        for root in roots {
+            let rootPath = root.path
+            let prefix = multiRoot ? root.lastPathComponent + "/" : ""
+            var rootFiles = Self.audioFilesUnder(root)
+            rootFiles.sort { $0.standardizedFileURL.path < $1.standardizedFileURL.path }
+            for file in rootFiles {
+                let path = file.standardizedFileURL.path
+                guard seenSources.insert(path).inserted else { continue }
+                let relPath = path.hasPrefix(rootPath)
+                    ? prefix + String(path.dropFirst(rootPath.count + 1))
+                    : prefix + file.lastPathComponent
+                files.append((url: file, relativePath: relPath))
+            }
+        }
+        files.sort { $0.url.standardizedFileURL.path < $1.url.standardizedFileURL.path }
+
+        let label = multiRoot
+            ? roots.map { $0.path }.joined(separator: ", ")
+            : roots.first?.path ?? ""
+        return await plan(files: files,
+                           sourceRootLabel: label,
+                           outputRoot: outputRoot,
+                           profile: profile,
+                           journalRecords: journalRecords)
+    }
+
+    /// The one canonical per-file planning loop. `files` carries each
+    /// file's batch-relative path (any album-folder prefix already
+    /// applied by the caller).
+    private func plan(files: [(url: URL, relativePath: String)],
+                      sourceRootLabel: String,
+                      outputRoot: URL,
+                      profile: ConversionProfile,
+                      journalRecords: [LocalImportJournalRecord]) async -> LocalImportPlan {
         var entries: [LocalImportPlanEntry] = []
         entries.reserveCapacity(files.count)
         var hashToFirstIndex: [String: Int] = [:]
         for (index, file) in files.enumerated() {
-            let probe = await prober.probe(url: file)
-            let relPath = file.standardizedFileURL.path.hasPrefix(rootPath)
-                ? String(file.standardizedFileURL.path.dropFirst(rootPath.count + 1))
-                : file.lastPathComponent
+            let probe = await prober.probe(url: file.url)
+            let relPath = file.relativePath
             let destination = outputRoot
                 .appendingPathComponent(relPath)
                 .deletingPathExtension()
                 .appendingPathExtension("m4a")
 
-            let sourceHash = Self.sha256Hex(fileURL: file)
+            let sourceHash = Self.sha256Hex(fileURL: file.url)
             let duplicateOf: Int? = {
                 guard let sourceHash else { return nil }
                 if let first = hashToFirstIndex[sourceHash] { return first }
@@ -314,7 +389,7 @@ public struct LocalImportEngine: Sendable {
                                          destinationIsOurs: destinationIsOurs,
                                          destinationIsValid: destinationIsValid)
 
-            entries.append(LocalImportPlanEntry(sourcePath: file.standardizedFileURL.path,
+            entries.append(LocalImportPlanEntry(sourcePath: file.url.standardizedFileURL.path,
                                                 relativePath: relPath,
                                                 destinationPath: destination.path,
                                                 sourceSHA256: sourceHash,
@@ -322,7 +397,7 @@ public struct LocalImportEngine: Sendable {
                                                 decision: decision,
                                                 duplicateOfIndex: duplicateOf))
         }
-        return LocalImportPlan(sourceRoot: rootPath,
+        return LocalImportPlan(sourceRoot: sourceRootLabel,
                                 outputRoot: outputRoot.standardizedFileURL.path,
                                 profile: profile,
                                 entries: entries)
@@ -559,6 +634,14 @@ public struct LocalImportEngine: Sendable {
             for format in formats {
                 let formatItems = (try? await asset.loadMetadata(for: format)) ?? []
                 for item in formatItems {
+                    // Extended fields first: they have NO common key, so the
+                    // commonKey path below can never carry them.
+                    if let identifier = item.identifier,
+                       let field = Self.extendedSourceIdentifiers[identifier.rawValue],
+                       let mapped = await Self.extendedMetadataItem(for: field, from: item) {
+                        items.append(mapped)
+                        continue
+                    }
                     guard let commonKey = item.commonKey else { continue }
                     // Text tags: map every format-specific identifier to its
                     // common equivalent (vorbis TITLE → common title, ID3
@@ -728,6 +811,140 @@ public struct LocalImportEngine: Sendable {
         case .commonKeyContributor: return .commonIdentifierContributor
         default: return nil
         }
+    }
+
+    // MARK: - Extended metadata carry (GAP B, phase 11)
+    //
+    // Album artist, disc number and track number have NO AVMetadata common
+    // key, so the commonKey mapping above silently drops them. Empirically
+    // pinned per container (probe, 2026-10-16, macOS 27 SDK):
+    //   FLAC  → vorb/ALBUMARTIST, vorb/DISCNUMBER, vorb/TRACKNUMBER (strings)
+    //   MP3   → id3/TPE2, id3/TPOS ("n/t"), id3/TRCK ("n/t")          (strings)
+    //   m4a   → itsk/aART (string), itsk/disk, itsk/trkn (8-byte binary atoms)
+    // WAV/AIFF surface only caaf/… items (no album artist/disc/track), so
+    // those containers contribute nothing here. The destination identifiers
+    // below were verified to survive the passthrough export byte-faithfully:
+    // aART lands as a text atom; trkn/disk land as the canonical 8-byte
+    // atoms (00 00 NN NN TT TT 00 00), identical to ffmpeg's layout.
+
+    /// The three carried fields that lack a common key.
+    enum ExtendedMetadataField: String, Sendable {
+        case albumArtist, discNumber, trackNumber
+    }
+
+    /// Destination iTunes-family identifier per field (verified to survive
+    /// the passthrough export; the m4a writer maps them onto itsk atoms).
+    static let extendedDestinationIdentifier: [ExtendedMetadataField: AVMetadataIdentifier] = [
+        .albumArtist: .iTunesMetadataAlbumArtist,
+        .discNumber: .iTunesMetadataDiscNumber,
+        .trackNumber: .iTunesMetadataTrackNumber,
+    ]
+
+    /// Source identifier (identifier.rawValue, format/keySpace-qualified) →
+    /// field. Exact spellings as AVFoundation reports them — see the
+    /// probe evidence above.
+    static let extendedSourceIdentifiers: [String: ExtendedMetadataField] = [
+        "vorb/ALBUMARTIST": .albumArtist,
+        "id3/TPE2": .albumArtist,
+        "itsk/aART": .albumArtist,
+        "vorb/DISCNUMBER": .discNumber,
+        "id3/TPOS": .discNumber,
+        "itsk/disk": .discNumber,
+        "vorb/TRACKNUMBER": .trackNumber,
+        "id3/TRCK": .trackNumber,
+        "itsk/trkn": .trackNumber,
+    ]
+
+    /// Largest value a trkn/disk 16-bit atom field can hold.
+    static let positionalTagLimit = 0xFFFF
+
+    /// Deterministic positional-tag parser for the ID3/vorbis value shapes
+    /// "n" and "n/total" (TPOS/TRCK spec form; vorbis DISCNUMBER/TRACKNUMBER
+    /// use the same shapes). Whitespace is trimmed; a non-integer number, a
+    /// negative, or an out-of-16-bit-range value rejects the whole tag;
+    /// an unparseable total keeps the number and drops the total. Returns
+    /// nil when no leading integer exists — unparseable values are skipped,
+    /// never guessed onto the output.
+    static func parsePositionalTag(_ raw: String) -> (number: Int, total: Int?)? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = trimmed.split(separator: "/",
+                                 maxSplits: 1,
+                                 omittingEmptySubsequences: false)
+        guard let rawNumber = parts.first,
+              let number = Int(rawNumber),
+              (0...Self.positionalTagLimit).contains(number) else { return nil }
+        let total: Int?
+        if parts.count > 1 {
+            total = Int(parts[1]).flatMap { (0...Self.positionalTagLimit).contains($0) ? $0 : nil }
+        } else {
+            total = nil
+        }
+        return (number, total)
+    }
+
+    /// Parse the canonical iTunes binary trkn/disk atom: 16-bit big-endian
+    /// number at offset 2, total at offset 4 when at least 6 bytes are
+    /// present. A zero total means "unset" (iTunes convention — ffmpeg
+    /// writes 00 00 in the total field when none was given) and is
+    /// normalized to nil. Anything shorter or empty is nil (skip, never
+    /// guess).
+    static func parsePositionalAtom(_ data: Data) -> (number: Int, total: Int?)? {
+        guard data.count >= 4 else { return nil }
+        func be16(_ offset: Int) -> Int {
+            (Int(data[offset]) << 8) | Int(data[offset + 1])
+        }
+        let number = be16(2)
+        guard number <= Self.positionalTagLimit else { return nil }
+        var total: Int?
+        if data.count >= 6 {
+            let raw = be16(4)
+            total = raw == 0 ? nil : raw
+        }
+        if let total, total > Self.positionalTagLimit { return nil }
+        return (number, total)
+    }
+
+    /// Canonical 8-byte iTunes trkn/disk atom payload (byte-identical to
+    /// ffmpeg's `-metadata track=7/12` output — verified probe 2026-10-16):
+    /// 00 00 NN NN TT TT 00 00, big-endian.
+    static func iTunesPositionalAtom(number: Int, total: Int?) -> Data {
+        var data = Data(count: 8)
+        func put16(_ value: Int, at offset: Int) {
+            data[offset] = UInt8((value >> 8) & 0xFF)
+            data[offset + 1] = UInt8(value & 0xFF)
+        }
+        put16(number, at: 2)
+        if let total { put16(total, at: 4) }
+        return data
+    }
+
+    /// Build the destination item for one extended field from a source
+    /// item. Album artist maps as text; disc/track map as the canonical
+    /// binary atom (string source values parsed first, then binary atom
+    /// payloads). Returns nil when the source carries no usable value —
+    /// the field is then simply not written.
+    static func extendedMetadataItem(for field: ExtendedMetadataField,
+                                     from item: AVMetadataItem) async -> AVMutableMetadataItem? {
+        let mapped = AVMutableMetadataItem()
+        mapped.identifier = extendedDestinationIdentifier[field]
+        switch field {
+        case .albumArtist:
+            guard let value = try? await item.load(.stringValue),
+                  !value.isEmpty else { return nil }
+            mapped.value = value as NSString
+            mapped.dataType = "public.utf8-plain-text"
+        case .discNumber, .trackNumber:
+            var position = (try? await item.load(.stringValue))
+                .flatMap(Self.parsePositionalTag)
+            if position == nil,
+               let data = try? await item.load(.dataValue) {
+                position = Self.parsePositionalAtom(data)
+            }
+            guard let position else { return nil }
+            mapped.value = Self.iTunesPositionalAtom(number: position.number,
+                                                     total: position.total) as NSData
+        }
+        return mapped
     }
 }
 
