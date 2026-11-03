@@ -1,5 +1,9 @@
 # tunory
 
+## Product roadmap
+
+See the [full Tunory product roadmap](docs/product-roadmap.md) for the local-library foundation, playlist duplicate cleanup, AI and voice-driven curation, Apple Music and Spotify provider plans, phased acceptance criteria, and release gates.
+
 ## Deployment
 
 See [Tunory deployment requirements](docs/deployment-requirements.md) for platform
